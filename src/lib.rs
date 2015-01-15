@@ -81,6 +81,13 @@ impl<Atom> GrowOnlySetState<Atom> where Atom: Ord + Send {
             })
     }
 
+    pub fn len(&self) -> usize {
+        self.inner_imm()
+            .query(move |: state: &BTreeSet<Atom>| {
+                state.len()
+            })
+    }
+
     pub fn merge(&mut self, right: BTreeSet<Atom>) {
         self.inner_mut()
             .merge(right)
@@ -90,25 +97,40 @@ impl<Atom> GrowOnlySetState<Atom> where Atom: Ord + Send {
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    mod grow_only_set_state {
+        use super::super::*;
+        #[test]
+        fn merge() {
+            let mut left = GrowOnlySetState::new();
+            let left_state = left.add(1u64)
+                .clone();
 
-    #[test]
-    fn grow_only_set_state() {
-        let mut left = GrowOnlySetState::new();
-        let left_state = left.add(1u64)
-            .clone();
+            let mut right = GrowOnlySetState::new();
+            let right_state = right.add(2u64)
+                .clone();
 
-        let mut right = GrowOnlySetState::new();
-        let right_state = right.add(2u64)
-            .clone();
+            left.merge(right_state);
+            assert!(left.lookup(&1u64));
+            assert!(left.lookup(&2u64));
+            assert_eq!(left.len(), 2);
 
-        left.merge(right_state);
-        assert!(left.lookup(&1u64));
-        assert!(left.lookup(&2u64));
+            right.merge(left_state);
+            assert!(right.lookup(&1u64));
+            assert!(right.lookup(&2u64));
+            assert_eq!(right.len(), 2);
+        }
 
-        right.merge(left_state);
-        assert!(right.lookup(&1u64));
-        assert!(right.lookup(&2u64));
+        #[test]
+        fn concurrent_add() {
+            let mut left = GrowOnlySetState::new();
+            let left_state = left.add(1u64)
+                .clone();
+
+            let mut right = GrowOnlySetState::new();
+            right.add(1u64);
+            right.merge(left_state);
+            assert!(right.lookup(&1u64));
+            assert_eq!(right.len(), 1);
+        }
     }
-
 }
