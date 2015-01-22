@@ -2,9 +2,9 @@ use super::{Operation, Replica, UpdateError};
 use super::{OpBasedReplica};
 use std::collections::{btree_map, BTreeMap};
 use std::error::Error;
-use std::marker::{ContravariantLifetime};
+use std::iter;
 
-#[derive(Clone)]
+#[derive(Clone, Show)]
 pub enum Op<Atom> {
     Add(Atom),
     Remove(Atom),
@@ -80,6 +80,7 @@ pub type UniqueState<A> = BTreeMap<A, bool>;
 pub type UniqueReplica<A> =
     Replica<UniqueState<A>, OpBasedReplica<Op<A>, UniqueState<A>>>;
 // An Op-based CRDT.
+#[derive(Clone, Show)]
 pub struct Unique<L, A>
     where L: super::Log<Op<A>>, A: Ord + Clone,
 {
@@ -88,24 +89,17 @@ pub struct Unique<L, A>
 }
 pub type UniqueError<L, A> = UpdateError<<L as super::Log<Op<A>>>::Error, OpError>;
 
-// An in order iterator over the non-tombstoned elements in the unique set.
-pub struct UniqueIter<'a, A: 'a> {
-    inner_iter: btree_map::Iter<'a, A, bool>,
-    _m1: ContravariantLifetime<'a>,
-}
-impl<'a, A> Iterator for UniqueIter<'a, A> {
-    type Item = &'a A;
-    fn next(&mut self) -> Option<&'a A> {
-        loop {
-            let this = self.inner_iter.next();
-            if this.is_none() { return None; }
-
-            let (a, &tombstone) = this.unwrap();
-            if tombstone { continue; }
-            else         { return Some(a); }
-        }
+impl<LHSL, RHSL, A> PartialEq<Unique<RHSL, A>> for Unique<LHSL, A>
+    where LHSL: super::Log<Op<A>>, RHSL: super::Log<Op<A>>,
+          A: PartialEq + Ord + Clone,
+{
+    fn eq(&self, rhs: &Unique<RHSL, A>) -> bool {
+        self.state.query(move |&: lhs| {
+            lhs.eq(rhs.state.query(move |: state| state ))
+        })
     }
 }
+
 impl<Log, Atom> Unique<Log, Atom>
     where Log: super::Log<Op<Atom>>,
           Atom: Ord + Clone,
@@ -129,11 +123,18 @@ impl<Log, Atom> Unique<Log, Atom>
             })
     }
 
-    pub fn iter(&self) -> UniqueIter<Atom> {
-        self.state.query(|state| UniqueIter {
-                inner_iter: state.iter(),
-                _m1: ContravariantLifetime,
-            } )
+    // Return a forward only iterator over the none tombstoned elements in this set.
+    pub fn iter(&self) -> iter::FilterMap<(&Atom, &bool), &Atom, btree_map::Iter<Atom, bool>, for<'a> fn((&'a Atom, &bool)) -> Option<&'a Atom>> {
+        fn filter_map<'a, A>((a, &tomb): (&'a A, &bool)) -> Option<&'a A> {
+            if !tomb { Some(a) }
+            else     { None    }
+        }
+
+        self.state
+            .query(|state| {
+                state.iter()
+                    .filter_map(filter_map as for<'a> fn((&'a Atom, &bool)) -> Option<&'a Atom>)
+            })
     }
 
     pub fn add(&mut self, v: Atom) -> Result<(), UniqueError<Log, Atom>> {
@@ -209,14 +210,10 @@ impl<Atom: Clone + Ord> Operation<BTreeMap<Atom, (u64, u64)>> for Op<Atom> {
             }
             &Op::Remove(ref v) => {
                 match state.get_mut(v) {
-                    Some(&mut (ref mut added, ref mut removed)) if *added > *removed => {
+                    Some(&mut (_, ref mut removed)) => {
                         *removed = *removed + 1;
                         return Ok(());
                     },
-                    Some(&mut (ref mut added, ref mut removed)) if *added <= *removed => {
-                        return Err(OpError::ValueNotPresent);
-                    },
-                    Some(_) => unreachable!(),
                     None => {},
                 }
                 assert!(state.insert(v.clone(), (0, 1)).is_none());
@@ -226,28 +223,39 @@ impl<Atom: Clone + Ord> Operation<BTreeMap<Atom, (u64, u64)>> for Op<Atom> {
     }
 }
 
-pub type TwoPSetState<A> = BTreeMap<A, (u64, u64)>;
-pub type TwoPSetReplica<A> =
-    Replica<TwoPSetState<A>, OpBasedReplica<Op<A>, TwoPSetState<A>>>;
+pub type PNState<A> = BTreeMap<A, (u64, u64)>;
+pub type PNReplica<A> =
+    Replica<PNState<A>, OpBasedReplica<Op<A>, PNState<A>>>;
 // A multi value set.
-pub struct TwoPSet<L, A>
+#[derive(Clone, Show)]
+pub struct PN<L, A>
     where L: super::Log<Op<A>>,
           A: Ord + Clone,
 {
-    state: TwoPSetReplica<A>,
+    state: PNReplica<A>,
     log: L,
 }
 
-pub type TwoPSetError<L, A> = UpdateError<<L as super::Log<Op<A>>>::Error, OpError>;
+impl<LHSL, RHSL, A> PartialEq<PN<RHSL, A>> for PN<LHSL, A>
+    where LHSL: super::Log<Op<A>>, RHSL: super::Log<Op<A>>,
+          A: PartialEq + Ord + Clone,
+{
+    fn eq(&self, rhs: &PN<RHSL, A>) -> bool {
+        self.state.query(move |&: lhs| {
+            lhs.eq(rhs.state.query(move |: state| state ))
+        })
+    }
+}
+pub type PNError<L, A> = UpdateError<<L as super::Log<Op<A>>>::Error, OpError>;
 
-impl<L, A> TwoPSet<L, A>
+impl<L, A> PN<L, A>
     where L: super::Log<Op<A>>,
           A: Ord + Clone,
           <L as super::Log<Op<A>>>::Error: Error,
-          <Op<A> as Operation<TwoPSetState<A>>>::Error: Error,
+          <Op<A> as Operation<PNState<A>>>::Error: Error,
 {
-    pub fn new_with_log(log: L) -> TwoPSet<L, A> {
-        TwoPSet {
+    pub fn new_with_log(log: L) -> PN<L, A> {
+        PN {
             state: super::Replica::new(),
             log: log,
         }
@@ -269,7 +277,21 @@ impl<L, A> TwoPSet<L, A>
             })
     }
 
-    fn update(&mut self, op: Op<A>) -> Result<(), TwoPSetError<L, A>> {
+    // Return a forward only iterator over the none tombstoned elements in this set.
+    pub fn iter(&self) -> iter::FilterMap<(&A, &(u64, u64)), &A, btree_map::Iter<A, (u64, u64)>, for<'a> fn((&'a A, &(u64, u64))) -> Option<&'a A>> {
+        fn filter_map<'a, A>((a, &(added, removed)): (&'a A, &(u64, u64))) -> Option<&'a A> {
+            if added > removed { Some(a) }
+            else               { None    }
+        }
+
+        self.state
+            .query(|state| {
+                state.iter()
+                    .filter_map(filter_map as for<'a> fn((&'a A, &(u64, u64))) -> Option<&'a A>)
+            })
+    }
+
+    fn update(&mut self, op: Op<A>) -> Result<(), PNError<L, A>> {
         let res = self.state.update(&op);
         match res {
             Ok(()) => self.log
@@ -279,11 +301,11 @@ impl<L, A> TwoPSet<L, A>
         }
     }
 
-    pub fn add(&mut self, v: A) -> Result<(), TwoPSetError<L, A>> {
+    pub fn add(&mut self, v: A) -> Result<(), PNError<L, A>> {
         let op = Op::Add(v);
         self.update(op)
     }
-    pub fn remove(&mut self, v: A) -> Result<(), TwoPSetError<L, A>> {
+    pub fn remove(&mut self, v: A) -> Result<(), PNError<L, A>> {
         let op = Op::Remove(v);
         self.update(op)
     }
@@ -297,7 +319,7 @@ impl<L, A> TwoPSet<L, A>
     }
 
     pub fn deliver(&mut self,
-                   ops: &[Op<A>]) -> (usize, Result<(), TwoPSetError<L, A>>) {
+                   ops: &[Op<A>]) -> (usize, Result<(), PNError<L, A>>) {
         let mut successful: usize = 0;
         for op in ops.iter() {
             let res = self.state.update(op);
@@ -320,30 +342,43 @@ impl<L, A> TwoPSet<L, A>
 #[cfg(test)]
 #[allow(dead_code)]
 mod test {
-    use {Log, Operation};
+    use {Log, Operation, UpdateError};
     use super::*;
     use std::error::Error;
 
+    // Our mock DumbLog can't fail:
     #[derive(Show)]
     pub struct NullError;
     impl Error for NullError {
         fn description(&self) -> &str { panic!("this error should never happen"); }
     }
     pub type UniqueSet = Unique<DumbLog<Op<u64>, UniqueState<u64>>, u64>;
-    #[derive(Default, Clone)]
+    pub type TestPN = super::PN<DumbLog<Op<u64>, PNState<u64>>, u64>;
+    #[derive(Default, Clone, Show)]
     pub struct DumbLog<O, S> where O: Operation<S> {
         log: Vec<O>,
 
         downstreamed: usize,
     }
     pub type TestDumbLog = DumbLog<Op<u64>, UniqueState<u64>>;
-    impl DumbLog<Op<u64>, UniqueState<u64>> {
-        fn deliver(&self, start: usize, end: Option<usize>, to: &mut UniqueSet) -> (usize, Result<(), UniqueError<TestDumbLog, u64>>) {
-            let ops = self.log.as_slice()
-                .slice(start, end.unwrap_or(self.len()));
-            to.deliver(ops)
+    macro_rules! impl_deliver {
+        ($state:ty, $set:ty => $func_name:ident) => {
+            impl DumbLog<Op<u64>, $state> {
+                fn $func_name(&self,
+                              start: usize,
+                              end: Option<usize>,
+                              to: &mut $set) -> (usize,
+                                                 Result<(), UpdateError<NullError, OpError>>)
+                {
+                    let ops = self.log.as_slice()
+                        .slice(start, end.unwrap_or(self.len()));
+                    to.deliver(ops)
+                }
+            }
         }
     }
+    impl_deliver! { UniqueState<u64>, UniqueSet => deliver_unique }
+    impl_deliver! { PNState<u64>, TestPN => deliver_pn }
     impl<O, S> DumbLog<O, S> {
         fn len(&self) -> usize { self.log.len() }
         fn downstreamed(&self) -> usize {
@@ -354,41 +389,40 @@ mod test {
         }
     }
         
-    pub fn new_dumb_log() -> TestDumbLog {
-        DumbLog {
-            log: Vec::new(),
-            downstreamed: 0,
+    macro_rules! new_dumb_log(
+        () => {
+            DumbLog {
+                log: Vec::new(),
+                downstreamed: 0,
+            }
+        }
+    );
+
+    macro_rules! impl_log_for_state {
+        ($for_type:ty) => {
+            impl Log<Op<u64>> for DumbLog<Op<u64>, $for_type> {
+                type Error = NullError;
+                fn apply_downstream(&mut self, op: Op<u64>) -> Result<(), NullError> {
+                    // for tests we ignore the 'must be durable' stipulation.
+                    self.downstreamed = self.downstreamed + 1;
+                    self.add_to_log(op)
+                }
+                fn add_to_log(&mut self, op: Op<u64>) -> Result<(), NullError> {
+                    self.log.push(op);
+                    Ok(())
+                }
+            }
         }
     }
-    impl Log<Op<u64>> for DumbLog<Op<u64>, UniqueState<u64>> {
-        type Error = NullError;
-        fn apply_downstream(&mut self, op: Op<u64>) -> Result<(), NullError> {
-            // for tests we ignore the 'must be durable' stipulation.
-            self.downstreamed = self.downstreamed + 1;
-            self.add_to_log(op)
-        }
-        fn add_to_log(&mut self, op: Op<u64>) -> Result<(), NullError> {
-            self.log.push(op);
-            Ok(())
-        }
-    }
+    impl_log_for_state! { UniqueState<u64> }
+    impl_log_for_state! { PNState<u64> }
+
     pub fn new_unique() -> UniqueSet {
-        Unique::new_with_log(new_dumb_log())
+        Unique::new_with_log(new_dumb_log!())
     }
 
-    pub fn identical_abstract_states(left: &UniqueSet, right: &UniqueSet) -> bool {
-        let mut li = left.iter();
-        let mut ri = right.iter();
-        loop {
-            let l = li.next();
-            let r = ri.next();
-            if l.is_none() && r.is_some() ||
-                l.is_some() && r.is_none() ||
-                l != r {
-                    return false;
-                }
-            else if l.is_none() && r.is_none() { return true; }
-        }
+    pub fn new_pn() -> TestPN {
+        PN::new_with_log(new_dumb_log!())
     }
 
     mod unique {
@@ -410,7 +444,7 @@ mod test {
             assert!(right.add(6u64).is_ok());
             assert!(right.remove(6u64).is_ok());
             let mut left = new_unique();
-            right.log_imm().deliver(0, None::<usize>, &mut left);
+            right.log_imm().deliver_unique(0, None, &mut left);
             assert_eq!(left.len(), 1);
             assert!(!left.lookup(&6u64))
         }
@@ -443,13 +477,13 @@ mod test {
             assert!(!left.lookup(&5u64));
 
             let left_log = left.log_imm().clone();
-            right.log_imm().deliver(0, None, &mut left);
+            right.log_imm().deliver_unique(0, None, &mut left);
 
             assert_eq!(left.log_imm().len(), 4);
             assert!(left.lookup(&6u64));
             assert!(left.lookup(&5u64));
 
-            left_log.deliver(0, None, &mut right);
+            left_log.deliver_unique(0, None, &mut right);
             assert_eq!(right.log_imm().len(), 4);
             assert!(right.lookup(&4u64));
             assert!(right.lookup(&3u64));
@@ -465,7 +499,7 @@ mod test {
 
             assert!(left.lookup(&6u64));
 
-            right.log_imm().deliver(0, None, &mut left);
+            right.log_imm().deliver_unique(0, None, &mut left);
 
             assert!(!left.lookup(&6u64));
         }
@@ -479,10 +513,94 @@ mod test {
             assert!(left.remove(6u64).is_ok());
 
             let left_log = left.log_imm().clone();
-            right.log_imm().deliver(0, None, &mut left);
-            left_log.deliver(0, None, &mut right);
+            right.log_imm().deliver_unique(0, None, &mut left);
+            left_log.deliver_unique(0, None, &mut right);
             
-            assert!(identical_abstract_states(&left, &right));
+            assert_eq!(left, right);
+        }
+    }
+    mod pn {
+        use super::*;
+        #[test]
+        fn log_len() {
+            let mut l = new_pn();
+            assert!(l.add(6u64).is_ok());
+            assert_eq!(l.log_imm().len(), 1);
+            assert!(l.remove(6u64).is_ok());
+            assert_eq!(l.log_imm().len(), 2);
+        }
+        #[test]
+        fn add_twice() {
+            let mut l = new_pn();
+            assert!(l.add(6u64).is_ok());
+            assert!(l.add(6u64).is_ok());
+            assert_eq!(l.count(&6u64), 2);
+        }
+        #[test]
+        fn add_twice_replicated() {
+            let mut l = new_pn();
+            assert!(l.add(6u64).is_ok());
+            assert!(l.add(6u64).is_ok());
+            assert_eq!(l.count(&6u64), 2);
+            
+            let mut r = new_pn();
+            l.log_imm().deliver_pn(0, None, &mut r);
+            assert_eq!(r.count(&6u64), 2);
+            assert_eq!(r.log_imm().not_downstreamed(), 2);
+        }
+        #[test]
+        fn remove_twice_add_once() {
+            let mut l = new_pn();
+            assert!(l.remove(6u64).is_ok());
+            assert!(l.remove(6u64).is_ok());
+            assert!(!l.lookup(&6u64));
+        }
+        #[test]
+        fn remove_twice_counted() {
+            let mut l = new_pn();
+            assert!(l.remove(6u64).is_ok());
+            assert_eq!(l.count(&6u64), -1);
+            assert!(l.remove(6u64).is_ok());
+            assert_eq!(l.count(&6u64), -2);
+        }
+        #[test]
+        fn remove_twice_logged() {
+            let mut l = new_pn();
+            assert!(l.remove(6u64).is_ok());
+            assert!(l.remove(6u64).is_ok());
+            assert_eq!(l.log_imm().len(), 2);
+            assert_eq!(l.log_imm().downstreamed(), 2);
+        }
+        #[test]
+        fn commute() {
+            let mut l = new_pn();
+            assert!(l.remove(6u64).is_ok());
+            assert!(l.remove(6u64).is_ok());
+
+            let mut r = new_pn();
+            assert!(r.add(6u64).is_ok());
+
+            let ll = l.log_imm().clone();
+            r.log_imm().deliver_pn(0, None, &mut l);
+
+            ll.deliver_pn(0, None, &mut r);
+            assert_eq!(r.count(&6u64), -1);
+            assert_eq!(l.count(&6u64), -1);
+        }
+        #[test]
+        fn delivery_order_insensitive() {
+            let mut right = new_pn();
+            assert!(right.add(6u64).is_ok());
+
+            let mut left = new_pn();
+            assert!(left.add(6u64).is_ok());
+            assert!(left.remove(6u64).is_ok());
+
+            let left_log = left.log_imm().clone();
+            right.log_imm().deliver_pn(0, None, &mut left);
+            left_log.deliver_pn(0, None, &mut right);
+
+            assert_eq!(left, right);
         }
     }
 }

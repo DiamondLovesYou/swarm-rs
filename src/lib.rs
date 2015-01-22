@@ -23,7 +23,7 @@ pub trait Log<Op> {
     // As with Log::apply_downstream, Log::add_to_log must make log changes durable.
     fn add_to_log(&mut self, op: Op) -> Result<(), <Self as Log<Op>>::Error>;
 }
-pub trait Operation<S> {
+pub trait Operation<S>: Clone {
     type Error;
     fn apply_to_state(&self,
                       state: &mut S) -> Result<(), <Self as Operation<S>>::Error>; 
@@ -57,9 +57,10 @@ impl<L, O> error::Error for UpdateError<L, O>
         }
     }
 }
-
+#[derive(Show, Clone)]
 pub struct StateBasedReplica<M, S>
     where M: Fn(S, S) -> S;
+#[derive(Show, Clone)]
 pub struct OpBasedReplica<O, S>
     where O: Operation<S>;
 
@@ -84,7 +85,7 @@ impl<O, S> Default for OpBasedReplica<O, S>
 }
 
 // A local replica of a state. Can be Op or State based.
-#[derive(Show)]
+#[derive(Show, Clone)]
 pub struct Replica<S: Default, T>
     where T: ReplicationKind,
 {
@@ -120,12 +121,6 @@ impl<S: Default, T: ReplicationKind> Replica<S, T> {
     }
 }
 
-pub trait OpLogStatePair<L, S> {
-    fn log_imm(&self) -> &L;
-    fn log_mut(&mut self) -> &mut L;
-    fn state_imm(&self) -> &S;
-}
-
 impl<S: Default + Send, M: Fn(S, S) -> S> Replica<S, StateBasedReplica<M, S>> {
     // Mutate the state locally. Returns a ref for downstream replicas.
     pub fn mutate<F>(&mut self, f: F) -> &S where F: FnOnce(&mut S) {
@@ -141,7 +136,6 @@ impl<S: Default + Send, M: Fn(S, S) -> S> Replica<S, StateBasedReplica<M, S>> {
         self.state = Some(new_state);
     }
 }
-
 
 type GOSSMerger<Atom> = fn(BTreeSet<Atom>, BTreeSet<Atom>) -> BTreeSet<Atom>;
 type GOSSReplica<A: Ord + Send> =
