@@ -1,6 +1,7 @@
 use super::{Operation, Replica, UpdateError};
-use super::{OpBasedReplica};
-use std::collections::{btree_map, BTreeMap};
+use super::{OpBasedReplica, StateBasedReplica};
+use std::borrow::BorrowFrom;
+use std::collections::{btree_map, BTreeMap, BTreeSet};
 use std::error::Error;
 use std::iter;
 
@@ -339,6 +340,60 @@ impl<L, A> PN<L, A>
     }
 }
 
+type GOSSMerger<Atom> = fn(BTreeSet<Atom>, BTreeSet<Atom>) -> BTreeSet<Atom>;
+type GOSSReplica<A: Ord + Send> =
+    Replica<BTreeSet<A>, StateBasedReplica<GOSSMerger<A>, BTreeSet<A>>>;
+pub struct GrowOnlySetState<Atom: Ord + Send>(GOSSReplica<Atom>);
+
+fn goss_merger<Atom>(mut left: BTreeSet<Atom>, right: BTreeSet<Atom>) -> BTreeSet<Atom>
+    where Atom: Ord + Send
+{
+    left.extend(right.into_iter());
+    left
+}
+
+impl<Atom> GrowOnlySetState<Atom> where Atom: Ord + Send {
+    pub fn new() -> GrowOnlySetState<Atom> {
+        GrowOnlySetState(Replica::new())
+    }
+
+    fn inner_imm(&self) -> &GOSSReplica<Atom> {
+        let &GrowOnlySetState(ref inner) = self;
+        inner
+    }
+    fn inner_mut(&mut self) -> &mut GOSSReplica<Atom> {
+        let &mut GrowOnlySetState(ref mut inner) = self;
+        inner
+    }
+
+    pub fn add(&mut self, v: Atom) -> &BTreeSet<Atom> {
+        self.inner_mut()
+            .mutate(move |: state: &mut BTreeSet<Atom>| {
+                state.insert(v);
+            })
+    }
+
+    pub fn lookup<T: ?Sized>(&self, v: &T) -> bool where T: BorrowFrom<Atom>, T: Ord {
+        self.inner_imm()
+            .query(move |&: state: &BTreeSet<Atom>| {
+                state.contains(v)
+            })
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner_imm()
+            .query(move |: state: &BTreeSet<Atom>| {
+                state.len()
+            })
+    }
+
+    pub fn merge(&mut self, right: BTreeSet<Atom>) {
+        self.inner_mut()
+            .merge(right, goss_merger)
+    }
+}
+
+
 #[cfg(test)]
 #[allow(dead_code)]
 mod test {
@@ -601,6 +656,42 @@ mod test {
             left_log.deliver_pn(0, None, &mut right);
 
             assert_eq!(left, right);
+        }
+    }
+    mod grow_only_set_state {
+        use super::super::*;
+        #[test]
+        fn merge() {
+            let mut left = GrowOnlySetState::new();
+            let left_state = left.add(1u64)
+                .clone();
+
+            let mut right = GrowOnlySetState::new();
+            let right_state = right.add(2u64)
+                .clone();
+
+            left.merge(right_state);
+            assert!(left.lookup(&1u64));
+            assert!(left.lookup(&2u64));
+            assert_eq!(left.len(), 2);
+
+            right.merge(left_state);
+            assert!(right.lookup(&1u64));
+            assert!(right.lookup(&2u64));
+            assert_eq!(right.len(), 2);
+        }
+
+        #[test]
+        fn concurrent_add() {
+            let mut left = GrowOnlySetState::new();
+            let left_state = left.add(1u64)
+                .clone();
+
+            let mut right = GrowOnlySetState::new();
+            right.add(1u64);
+            right.merge(left_state);
+            assert!(right.lookup(&1u64));
+            assert_eq!(right.len(), 1);
         }
     }
 }
