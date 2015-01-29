@@ -3,3 +3,7 @@
 name = "swarm-rs"
 version = "0.0.1"
 authors = ["Richard Diamond <wichard@vitalitystudios.com>"]
+
+
+[dependencies]
+uuid = "0.1.8"

@@ -3,9 +3,13 @@ use super::{OpBasedReplica, StateBasedReplica};
 use std::borrow::BorrowFrom;
 use std::collections::{btree_map, BTreeMap, BTreeSet};
 use std::error::Error;
+use std::fmt;
 use std::iter;
+use std::cmp::Ordering;
+use std::ops::Deref;
+use uuid;
 
-#[derive(Clone, Show)]
+#[derive(Clone, Debug)]
 pub enum Op<Atom> {
     Add(Atom),
     Remove(Atom),
@@ -19,8 +23,7 @@ impl<Atom> Op<Atom> {
 }
 
 // TODO partial order for Op. The order should represent a requisite delivery order.
-
-#[derive(Copy, Clone, Show)]
+#[derive(Copy, Clone, Debug)]
 pub enum OpError {
     ValueAlreadyPresent,
     ValueNotPresent,
@@ -34,6 +37,11 @@ impl Error for OpError {
             &OpError::ValueTombstoned => "that value is marked with a tombstone; \
                                           it is impossible to re-add it to the set",
         }
+    }
+}
+impl fmt::Display for OpError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(self.description())
     }
 }
 
@@ -341,8 +349,7 @@ impl<L, A> PN<L, A>
 }
 
 type GOSSMerger<Atom> = fn(BTreeSet<Atom>, BTreeSet<Atom>) -> BTreeSet<Atom>;
-type GOSSReplica<A: Ord + Send> =
-    Replica<BTreeSet<A>, StateBasedReplica<GOSSMerger<A>, BTreeSet<A>>>;
+type GOSSReplica<A> = Replica<BTreeSet<A>, StateBasedReplica<GOSSMerger<A>, BTreeSet<A>>>;
 pub struct GrowOnlySetState<Atom: Ord + Send>(GOSSReplica<Atom>);
 
 fn goss_merger<Atom>(mut left: BTreeSet<Atom>, right: BTreeSet<Atom>) -> BTreeSet<Atom>
@@ -393,84 +400,187 @@ impl<Atom> GrowOnlySetState<Atom> where Atom: Ord + Send {
     }
 }
 
-
-#[cfg(test)]
-#[allow(dead_code)]
-mod test {
-    use {Log, Operation, UpdateError};
-    use super::*;
-    use std::error::Error;
-
-    // Our mock DumbLog can't fail:
-    #[derive(Show)]
-    pub struct NullError;
-    impl Error for NullError {
-        fn description(&self) -> &str { panic!("this error should never happen"); }
+#[derive(Clone, Eq, PartialEq)]
+pub struct ORElement<A>(A, uuid::Uuid);
+impl<A> Deref for ORElement<A> {
+    type Target = A;
+    fn deref<'a>(&'a self) -> &'a A {
+        let &ORElement(ref inner, _) = self;
+        inner
     }
-    pub type UniqueSet = Unique<DumbLog<Op<u64>, UniqueState<u64>>, u64>;
-    pub type TestPN = super::PN<DumbLog<Op<u64>, PNState<u64>>, u64>;
-    #[derive(Default, Clone, Show)]
-    pub struct DumbLog<O, S> where O: Operation<S> {
-        log: Vec<O>,
+}
+impl<A: fmt::Debug> fmt::Debug for ORElement<A> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let &ORElement(ref v, ref id) = self;
 
-        downstreamed: usize,
+        write!(f, "ORElement({:?}, {})", v, id.to_hyphenated_string())
     }
-    pub type TestDumbLog = DumbLog<Op<u64>, UniqueState<u64>>;
-    macro_rules! impl_deliver {
-        ($state:ty, $set:ty => $func_name:ident) => {
-            impl DumbLog<Op<u64>, $state> {
-                fn $func_name(&self,
-                              start: usize,
-                              end: Option<usize>,
-                              to: &mut $set) -> (usize,
-                                                 Result<(), UpdateError<NullError, OpError>>)
-                {
-                    let ops = self.log.as_slice()
-                        .slice(start, end.unwrap_or(self.len()));
-                    to.deliver(ops)
+}
+
+
+impl<A: PartialEq + Ord> PartialOrd for ORElement<A> {
+    fn partial_cmp(&self, rhs: &ORElement<A>) -> Option<Ordering> {
+        Some(self.cmp(rhs))
+    }
+}
+impl<A: Eq + Ord> Ord for ORElement<A> {
+    fn cmp(&self, rhs: &ORElement<A>) -> Ordering {
+        fn get_uuid_u128(uuid: &uuid::Uuid) -> (u64, u64) {
+            let mut i = uuid.as_bytes().iter().map(|&v| v as u64 );
+            let s = &mut i;
+            fn n<I>(iter: &mut I) -> <I as Iterator>::Item
+                where I: Iterator,
+                      <I as Iterator>::Item: Clone,
+            {
+                iter.next().unwrap().clone()
+            }
+            (n(s) << 0  | n(s) << 8  | n(s) << 16 | n(s) << 24 |
+             n(s) << 32 | n(s) << 40 | n(s) << 48 | n(s) << 56,
+
+             n(s) << 0  | n(s) << 8  | n(s) << 16 | n(s) << 24 |
+             n(s) << 32 | n(s) << 40 | n(s) << 48 | n(s) << 56)
+        }
+        let &ORElement(ref l, ref lid) = self;
+        let &ORElement(ref r, ref rid) = rhs;
+
+        match l.cmp(r) {
+            Ordering::Equal => {
+                let (vl1, vl2) = get_uuid_u128(lid);
+                let (vr1, vr2) = get_uuid_u128(rid);
+                match vl1.cmp(&vr1) {
+                    Ordering::Equal => {},
+                    cmp => { return cmp; },
+                }
+                return vl2.cmp(&vr2);
+            },
+            cmp => { return cmp; }
+        }
+    }
+}
+
+pub type ORState<A> = BTreeSet<ORElement<A>>;
+pub type OROp<A> = Op<ORElement<A>>;
+
+impl<A: Clone + Ord> Operation<ORState<A>> for Op<ORElement<A>> {
+    type Error = OpError;
+    fn apply_to_state(&self,
+                      state: &mut ORState<A>) -> Result<(), OpError> {
+        match self {
+            &Op::Add(ref v) => {
+                if !state.insert(v.clone()) {
+                    Err(OpError::ValueAlreadyPresent)
+                } else {
+                    Ok(())
                 }
             }
-        }
-    }
-    impl_deliver! { UniqueState<u64>, UniqueSet => deliver_unique }
-    impl_deliver! { PNState<u64>, TestPN => deliver_pn }
-    impl<O, S> DumbLog<O, S> {
-        fn len(&self) -> usize { self.log.len() }
-        fn downstreamed(&self) -> usize {
-            self.downstreamed
-        }
-        fn not_downstreamed(&self) -> usize {
-            self.len() - self.downstreamed()
-        }
-    }
-        
-    macro_rules! new_dumb_log(
-        () => {
-            DumbLog {
-                log: Vec::new(),
-                downstreamed: 0,
-            }
-        }
-    );
-
-    macro_rules! impl_log_for_state {
-        ($for_type:ty) => {
-            impl Log<Op<u64>> for DumbLog<Op<u64>, $for_type> {
-                type Error = NullError;
-                fn apply_downstream(&mut self, op: Op<u64>) -> Result<(), NullError> {
-                    // for tests we ignore the 'must be durable' stipulation.
-                    self.downstreamed = self.downstreamed + 1;
-                    self.add_to_log(op)
-                }
-                fn add_to_log(&mut self, op: Op<u64>) -> Result<(), NullError> {
-                    self.log.push(op);
+            &Op::Remove(ref v) => {
+                if !state.remove(v) {
+                    Err(OpError::ValueNotPresent)
+                } else {
                     Ok(())
                 }
             }
         }
     }
+}
+
+pub type ORError<L, A> =
+    UpdateError<<L as super::Log<OROp<A>>>::Error, OpError>;
+
+pub type ORReplica<A> =
+    Replica<ORState<A>, OpBasedReplica<OROp<A>, ORState<A>>>;
+// An observe only set.
+#[derive(Clone, Debug)]
+pub struct OR<L, A>
+    where L: super::Log<OROp<A>>,
+          A: Ord + Clone,
+{
+    state: ORReplica<A>,
+    log: L,
+}
+impl<L, A> OR<L, A>
+    where L: super::Log<OROp<A>>,
+          A: Ord + Clone,
+          <L as super::Log<OROp<A>>>::Error: Error,
+          <OROp<A> as Operation<ORState<A>>>::Error: Error,
+{
+    pub fn new_with_log(log: L) -> OR<L, A> {
+        OR {
+            state: super::Replica::new(),
+            log: log,
+        }
+    }
+
+    pub fn log_imm(&self) -> &L { &self.log }
+    pub fn log_mut(&mut self) -> &mut L { &mut self.log }
+
+    pub fn lookup(&self, element: &ORElement<A>) -> bool {
+        self.state
+            .query(move |&: s| s.contains(element) )
+    }
+
+    fn update(&mut self, op: OROp<A>) -> Result<(), ORError<L, A>> {
+        let res = self.state
+            .update(&op)
+            .map_err(|err| UpdateError::Op(err) );
+        match res {
+            Ok(()) => self.log_mut()
+                .apply_downstream(op)
+                .map_err(|err| UpdateError::Log(err) ),
+            err => err,
+        }
+    }
+
+    pub fn insert(&mut self, v: A) -> Result<ORElement<A>, ORError<L, A>> {
+        let id = uuid::Uuid::new_v4();
+        let element = ORElement(v, id);
+        let op = Op::Add(element.clone());
+        self.update(op)
+            .map(move |:()| element )
+    }
+    pub fn remove(&mut self, element: ORElement<A>) -> Result<(), ORError<L, A>> {
+        let op = Op::Remove(element);
+        self.update(op)
+    }
+    pub fn deliver(&mut self,
+                   ops: &[OROp<A>]) -> (usize, Result<(), ORError<L, A>>) {
+        let mut successful: usize = 0;
+        for op in ops.iter() {
+            let res = self.state
+                .update(op);
+            let res = match res {
+                Ok(()) => self.log
+                    .add_to_log(op.clone())
+                    .map_err(|err| UpdateError::Log(err) ),
+                Err(err) => Err(UpdateError::Op(err)),
+            };
+            if res.is_ok() {
+                successful += 1;
+            } else {
+                return (successful, res);
+            }
+        }
+        return (successful, Ok(()));
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+mod test {
+    use {Log, UpdateError};
+    use super::*;
+    use test_helpers::*;
+
+    pub type UniqueSet = Unique<DumbLog<Op<u64>, UniqueState<u64>>, u64>;
+    pub type TestPN = super::PN<DumbLog<Op<u64>, PNState<u64>>, u64>;
+    pub type TestDumbLog = DumbLog<Op<u64>, UniqueState<u64>>;
+    pub type TestOR = super::OR<DumbLog<OROp<u64>, ORState<u64>>, u64>;
+    impl_deliver! { UniqueState<u64>, UniqueSet => deliver_unique }
+    impl_deliver! { PNState<u64>, TestPN => deliver_pn }
+    impl_deliver! { ORState<u64>, OROp<u64>, TestOR => deliver_or }
     impl_log_for_state! { UniqueState<u64> }
     impl_log_for_state! { PNState<u64> }
+    impl_log_for_state! { ORState<u64>, OROp<u64> }
 
     pub fn new_unique() -> UniqueSet {
         Unique::new_with_log(new_dumb_log!())
@@ -479,11 +589,15 @@ mod test {
     pub fn new_pn() -> TestPN {
         PN::new_with_log(new_dumb_log!())
     }
+    pub fn new_or() -> TestOR {
+        OR::new_with_log(new_dumb_log!())
+    }
 
     mod unique {
         use {UpdateError};
         use super::*;
         use super::super::OpError;
+
         #[test]
         fn op_log_len() {
             let mut local = new_unique();
@@ -499,7 +613,7 @@ mod test {
             assert!(right.add(6u64).is_ok());
             assert!(right.remove(6u64).is_ok());
             let mut left = new_unique();
-            right.log_imm().deliver_unique(0, None, &mut left);
+            deliver_unique(right.log_imm(), 0, None, &mut left);
             assert_eq!(left.len(), 1);
             assert!(!left.lookup(&6u64))
         }
@@ -532,13 +646,13 @@ mod test {
             assert!(!left.lookup(&5u64));
 
             let left_log = left.log_imm().clone();
-            right.log_imm().deliver_unique(0, None, &mut left);
+            deliver_unique(right.log_imm(), 0, None, &mut left);
 
             assert_eq!(left.log_imm().len(), 4);
             assert!(left.lookup(&6u64));
             assert!(left.lookup(&5u64));
 
-            left_log.deliver_unique(0, None, &mut right);
+            deliver_unique(&left_log, 0, None, &mut right);
             assert_eq!(right.log_imm().len(), 4);
             assert!(right.lookup(&4u64));
             assert!(right.lookup(&3u64));
@@ -554,7 +668,7 @@ mod test {
 
             assert!(left.lookup(&6u64));
 
-            right.log_imm().deliver_unique(0, None, &mut left);
+            deliver_unique(right.log_imm(), 0, None, &mut left);
 
             assert!(!left.lookup(&6u64));
         }
@@ -568,9 +682,9 @@ mod test {
             assert!(left.remove(6u64).is_ok());
 
             let left_log = left.log_imm().clone();
-            right.log_imm().deliver_unique(0, None, &mut left);
-            left_log.deliver_unique(0, None, &mut right);
-            
+            deliver_unique(right.log_imm(), 0, None, &mut left);
+            deliver_unique(&left_log, 0, None, &mut right);
+
             assert_eq!(left, right);
         }
     }
@@ -597,9 +711,9 @@ mod test {
             assert!(l.add(6u64).is_ok());
             assert!(l.add(6u64).is_ok());
             assert_eq!(l.count(&6u64), 2);
-            
+
             let mut r = new_pn();
-            l.log_imm().deliver_pn(0, None, &mut r);
+            deliver_pn(l.log_imm(), 0, None, &mut r);
             assert_eq!(r.count(&6u64), 2);
             assert_eq!(r.log_imm().not_downstreamed(), 2);
         }
@@ -636,9 +750,9 @@ mod test {
             assert!(r.add(6u64).is_ok());
 
             let ll = l.log_imm().clone();
-            r.log_imm().deliver_pn(0, None, &mut l);
+            deliver_pn(r.log_imm(), 0, None, &mut l);
 
-            ll.deliver_pn(0, None, &mut r);
+            deliver_pn(&ll, 0, None, &mut r);
             assert_eq!(r.count(&6u64), -1);
             assert_eq!(l.count(&6u64), -1);
         }
@@ -652,8 +766,8 @@ mod test {
             assert!(left.remove(6u64).is_ok());
 
             let left_log = left.log_imm().clone();
-            right.log_imm().deliver_pn(0, None, &mut left);
-            left_log.deliver_pn(0, None, &mut right);
+            deliver_pn(right.log_imm(), 0, None, &mut left);
+            deliver_pn(&left_log, 0, None, &mut right);
 
             assert_eq!(left, right);
         }
@@ -692,6 +806,117 @@ mod test {
             right.merge(left_state);
             assert!(right.lookup(&1u64));
             assert_eq!(right.len(), 1);
+        }
+    }
+
+    mod or {
+        use {UpdateError};
+        use super::*;
+        use super::super::*;
+        use test_helpers::DumbLog;
+
+        type TestORError =
+            ORError<DumbLog<OROp<u64>, ORState<u64>>, u64>;
+        type TestORResult =
+            Result<(), TestORError>;
+
+        #[test]
+        fn insert() {
+            let mut l = new_or();
+            let _e1 = l.insert(6u64).unwrap();
+            let _e2 = l.insert(6u64).unwrap();
+        }
+
+        #[test]
+        fn inserts_commute() {
+            let mut l = new_or();
+            let le1 = l.insert(6u64).unwrap();
+            let ll = l.log_imm().clone();
+
+            let mut r = new_or();
+            let re1 = r.insert(6u64).unwrap();
+            let rl = r.log_imm().clone();
+
+            let (_, res) = deliver_or(&ll, 0, None, &mut r);
+            res.unwrap();
+            let (_, res) = deliver_or(&rl, 0, None, &mut l);
+            res.unwrap();
+
+            assert!(l.lookup(&re1));
+            assert!(l.lookup(&le1));
+            assert!(r.lookup(&re1));
+            assert!(r.lookup(&le1));
+        }
+
+        #[test]
+        fn inserts_are_unique() {
+            let mut l = new_or();
+            let le1 = l.insert(6u64).unwrap();
+            let ll = l.log_imm().clone();
+
+            let mut r = new_or();
+            let re1 = r.insert(6u64).unwrap();
+            let rl = r.log_imm().clone();
+
+            assert!(match r.remove(le1.clone()) {
+                Err(UpdateError::Op(OpError::ValueNotPresent)) => true,
+                _ => false,
+            });
+            assert!(match l.remove(re1.clone()) {
+                Err(UpdateError::Op(OpError::ValueNotPresent)) => true,
+                _ => false,
+            });
+
+            let (_, res) = deliver_or(&ll, 0, None, &mut r);
+            res.unwrap();
+            let (_, res) = deliver_or(&rl, 0, None, &mut l);
+            res.unwrap();
+
+            l.remove(le1.clone()).unwrap();
+            assert!(l.lookup(&re1));
+            r.remove(re1.clone()).unwrap();
+            assert!(r.lookup(&le1));
+        }
+
+        #[test]
+        fn remove() {
+            let mut l = new_or();
+            let v = l.insert(6u64).unwrap();
+            l.remove(v).unwrap();
+        }
+
+        #[test]
+        fn removes_commute() {
+            let mut l = new_or();
+            let le1 = l.insert(6u64).unwrap();
+
+            let mut r = new_or();
+            let re1 = r.insert(6u64).unwrap();
+
+            let ll = l.log_imm().clone();
+            let rl = r.log_imm().clone();
+
+            let (_, res) = deliver_or(&ll, 0, None, &mut r);
+            res.unwrap();
+            let (_, res) = deliver_or(&rl, 0, None, &mut l);
+            res.unwrap();
+
+            let offset = l.log_imm().len();
+
+            println!("l: {:?}", l);
+            println!("r: {:?}", r);
+
+            l.remove(re1.clone()).unwrap();
+            let (_, res) = deliver_or(l.log_imm(), offset, None, &mut r);
+            res.unwrap();
+
+            println!("l: {:?}", l);
+            println!("r: {:?}", r);
+
+            assert!(!l.lookup(&re1));
+            assert!(l.lookup(&le1));
+            assert!(!r.lookup(&re1));
+            assert!(r.lookup(&le1));
         }
     }
 }
