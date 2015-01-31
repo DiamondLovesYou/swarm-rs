@@ -1,8 +1,11 @@
 use {OpBasedReplica, UpdateError};
 use std::collections::bitv;
 use std::collections::{Bitv, BTreeMap};
+use std::collections::btree_map::{self, Range};
+use std::collections::Bound::{Included, Excluded, Unbounded};
 use std::cmp::{Ordering};
 use std::default::Default;
+
 pub use super::set::OpError;
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -12,67 +15,7 @@ pub trait SiteIdentifier {
     fn site_id(&self) -> SiteId;
 }
 
-#[derive(Default, Clone, Debug)]
-pub struct Node<Atom> {
-    left: Option<Box<Node<Atom>>>,
-    kind: Option<Kind<Atom>>,
-    right: Option<Box<Node<Atom>>>,
-}
-impl<A> Node<A> {
-/*    pub fn insert_at(&mut self, at: &Path, v: A) {
-        let mut this = self;
-        for i in at.iter() {
-            match i {
-                &PathEntry::Bit(side) => {
-                    this = if side {
-                        if this.right.is_none() {
-                            this.right = Some(box Default::default());
-                        }
-                        &mut *this.right.as_mut().unwrap()
-                    } else {
-                        if this.left.is_none() {
-                            this.left = Some(box Default::default());
-                        }
-                        &mut *this.left.as_mut().unwrap()
-                    };
-                },
-                &PathEntry::Ambiguity(ref dis) => {
-                    match this.kind {
-                        None => {
-                            this.kind = Some(Kind::Normal(dis.clone(), v));
-                        }
-                    }
-                },
-            }
-        }
-    }*/
-}
-
-#[derive(Clone, Debug)]
-enum Kind<Atom> {
-    Tombstone,
-    Normal(Disambiguator, Atom),
-    Major {
-        minis: BTreeMap<Disambiguator, Node<Atom>>,
-    },
-}
-impl<Atom> Kind<Atom> {
-    pub fn is_major(&self) -> bool {
-        match self {
-            &Kind::Major { .. } => true,
-            _ => false,
-        }
-    }
-    pub fn get_node<'a>(&'a self, dis: &Disambiguator) -> Option<&'a Node<Atom>> {
-        match self {
-            &Kind::Normal(..) | &Kind::Tombstone => None,
-            &Kind::Major { ref minis, } => minis.get(dis),
-        }
-    }
-
-}
-
-#[derive(Eq, Ord, PartialEq, PartialOrd, Clone, Copy, Debug)]
+#[derive(Eq, Ord, PartialEq, PartialOrd, Clone, Copy, Debug, Hash)]
 pub struct Disambiguator {
     counter: u64,
     site: SiteId,
@@ -85,8 +28,9 @@ impl Disambiguator {
             site: site,
         }
     }
+    pub fn site_id(&self) -> SiteId { self.site }
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct Path {
     // False is left, true is right.
     prefix: Bitv,
@@ -101,26 +45,141 @@ impl Path {
     }
 
     #[cfg(test)]
-    pub fn new_raw(prefix: Bitv, next: Option<(Disambiguator, Option<Box<Path>>)>) -> Path {
+    pub fn new_raw(prefix: Bitv,
+                   next: Option<(Disambiguator, Option<Box<Path>>)>) -> Path {
+        if let Some((_, Some(ref p))) = next {
+            assert!(!p.empty());
+        }
+
         Path {
             prefix: prefix,
             next: next,
         }
     }
-    /// Assuming this Path starts at the root, return the height of the tree.
-    pub fn height(&self) -> usize {
-        let mut h = 0;
-        // TODO count the prefix all at once.
-        for i in self.iter() {
-            match i {
-                PathEntry::Bit(_) => {
-                    h += 1;
-                },
-                _ => {},
+
+    pub fn ends_with_disambiguator(&self) -> bool {
+        match self.next.as_ref() {
+            None => false,
+            Some(&(_, None)) => true,
+            Some(&(_, Some(ref next))) => next.ends_with_disambiguator(),
+        }
+    }
+
+    pub fn next_imm(&self) -> Option<&Path> {
+        self.next
+            .as_ref()
+            .and_then(move |: &(_, ref v)| {
+                v.as_ref()
+                    .map(move |: v| &(**v) )
+            })
+    }
+    fn next_mut(&mut self) -> Option<&mut Path> {
+        self.next
+            .as_mut()
+            .and_then(move |: &mut (_, ref mut p)| {
+                p.as_mut()
+                    .map(move |: b| &mut (**b) )
+            })
+    }
+    fn next_box_mut(&mut self) -> Option<&mut Box<Path>> {
+        self.next
+            .as_mut()
+            .and_then(move |: &mut (_, ref mut p)| p.as_mut() )
+    }
+
+    pub fn disambiguator(&self) -> Option<&Disambiguator> {
+        self.next
+            .as_ref()
+            .map(move |: &(ref dis, _)| dis )
+    }
+    pub fn last_disambiguator(&self) -> Option<&Disambiguator> {
+        self.next
+            .as_ref()
+            .and_then(move |: &(ref dis, ref n)| {
+                if let &Some(ref n) = n {
+                    n.last_disambiguator()
+                } else {
+                    Some(dis)
+                }
+            })
+    }
+
+    fn take_last_disambiguator(&mut self) -> Option<Disambiguator> {
+        self.next
+            .as_mut()
+            .and_then(move |: &mut (_, ref mut n)| {
+                n.as_mut()
+                    .and_then(move |: n| n.take_last_disambiguator() )
+            })
+            .or_else(move |:| {
+                self.next
+                    .take()
+                    .map(move |: (dis, _)| dis )
+            })
+    }
+
+    fn take_next(&mut self) -> Option<Box<Path>> {
+        self.next
+            .as_mut()
+            .and_then(move |: &mut (_, ref mut next_opt)| next_opt.take() )
+    }
+
+    fn push_prefix(&mut self, prefix: &Bitv) {
+        if let Some(next) = self.next_mut() {
+            next.push_prefix(prefix);
+            return;
+        }
+
+        if let Some(&dis) = self.disambiguator() {
+            // create a new path:
+            let next = Path {
+                prefix: prefix.clone(),
+                next: None,
+            };
+            self.next = Some((dis, Some(box next)));
+        } else {
+            self.prefix.extend(prefix.iter());
+        }
+    }
+    fn set_last_disambiguator(&mut self, dis: Disambiguator, p: Option<Box<Path>>) {
+        match self.next {
+            None | Some((_, None)) => {
+                debug_assert!(p.as_ref().map(move |: p| !p.empty() ).unwrap_or(true));
+                self.next = Some((dis, p));
+            }
+            Some((_, Some(ref mut next))) => {
+                next.set_last_disambiguator(dis, p)
             }
         }
-        return h;
     }
+
+    /// Assuming this Path starts at the root, return the height of the tree.
+    pub fn height(&self) -> usize {
+        let mut this_opt = Some(self);
+        let mut count: usize = 0;
+        loop {
+            let this = match this_opt {
+                None => break,
+                Some(this) => this,
+            };
+            count += this.prefix.len();
+            this_opt = this.next_imm();
+        }
+        return count;
+    }
+
+    /// Get the depth of disambiguators
+    pub fn links(&self) -> usize {
+        let rest = self.next_imm()
+            .map(|n| n.links() )
+            .unwrap_or(0);
+        let own = self.disambiguator()
+            .map(|_| 1 )
+            .unwrap_or(0);
+
+        rest + own
+    }
+
     /// a.k.a. is this the root?
     pub fn empty(&self) -> bool {
         self.prefix.len() == 0
@@ -136,7 +195,87 @@ impl Path {
             next:        next.as_ref(),
         }
     }
+
+    pub fn distance(&self, rhs: &Path) -> usize {
+        let mut liter = self.iter();
+        let mut riter = rhs.iter();
+
+        let mut diverged = false;
+        let mut distance: usize = 0;
+
+        loop {
+            let l = liter.next();
+            let r = riter.next();
+
+            match (l, r) {
+                (None, None) => return distance,
+                (Some(ref lv), Some(ref rv)) if lv == rv => {
+                    if diverged { distance += 2; }
+                },
+                (Some(ref lv), Some(ref rv)) if lv != rv => {
+                    diverged = true;
+                    distance += 2;
+                },
+
+                (None, Some(_)) | (Some(_), None) => {
+                    diverged = true;
+                    distance += 1;
+                },
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    pub fn last_bit(&self) -> Option<bool> {
+        self.next_imm()
+            .and_then(|n| n.last_bit() )
+            .or_else(|| {
+                if self.prefix.len() == 0 {
+                    None
+                } else {
+                    Some(self.prefix[self.prefix.len() - 1])
+                }
+            })
+    }
+
+    fn last_path_mut(&mut self) -> &mut Path {
+        match self.next {
+            None | Some((_, None)) => {},
+            Some((_, Some(ref mut next))) => {
+                return next.last_path_mut();
+            },
+        }
+        self
+    }
 }
+pub trait ChildPath {
+    fn get_child(self, side: Side) -> Path;
+}
+impl ChildPath for Option<Path> {
+    fn get_child(self, side: Side) -> Path {
+        match self {
+            None => Path {
+                prefix: Bitv::from_elem(1, side.to_bit()),
+                next: None,
+            },
+            Some(mut p) => {
+                p.last_path_mut()
+                    .prefix
+                    .grow(1, side.to_bit());
+                p
+            }
+        }
+    }
+}
+impl ChildPath for Path {
+    fn get_child(mut self, side: Side) -> Path {
+        self.last_path_mut()
+            .prefix
+            .grow(1, side.to_bit());
+        self
+    }
+}
+
 impl Eq for Path {}
 impl PartialEq for Path {
     fn eq(&self, rhs: &Path) -> bool {
@@ -206,8 +345,6 @@ impl Ord for Path {
                 (None, Some(PathEntry::Bit(false))) => { return Ordering::Greater; },
             }
         } // Loop.
-
-        unreachable!();
     }
 }
 
@@ -243,6 +380,25 @@ impl<'a> Iterator for PathEntries<'a> {
         }
     }
 }
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum Side {
+    Left,
+    Right,
+}
+impl Side {
+    fn to_bit(&self) -> bool {
+        match self {
+            &Side::Left => false,
+            &Side::Right => true,
+        }
+    }
+    pub fn opposite_side(self) -> Side {
+        match self {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
+        }
+    }
+}
 #[derive(Clone)]
 pub enum Op<A> {
     /// Atoms are always inserted with disambiguators; however, paths don't
@@ -257,71 +413,12 @@ impl<A: Clone> super::Operation<State<A>> for Op<A> {
     type Error = OpError;
     fn apply_to_state(&self,
                       state: &mut State<A>) -> Result<(), OpError> {
-        /*fn at_node_kind<F>(at: &Path, state: &mut State<A>) {
-            let mut this = self;
-            let mut iter = at.iter().peekable();
-            for i in iter {
-                match i {
-                    &PathEntry::Bit(side) => {
-                        this = if side {
-                            if this.right.is_none() {
-                                this.right = Some(box Default::default());
-                            }
-                            &mut *this.right.as_mut().unwrap()
-                        } else {
-                            if this.left.is_none() {
-                                this.left = Some(box Default::default());
-                            }
-                            &mut *this.left.as_mut().unwrap()
-                        };
-                    },
-                    &PathEntry::Ambiguity(ref dis) => {
-                        match this.kind {
-                            None => {
-                                this.kind = Some(Kind::Normal(dis.clone(), v));
-                            }
-                        }
-                    },
-                }
-            }
-        }
-
-        fn insert() {
-            let mut this = self;
-            let mut iter = at.iter().peekable();
-            for i in at.iter() {
-                match i {
-                    &PathEntry::Bit(side) => {
-                        this = if side {
-                            if this.right.is_none() {
-                                this.right = Some(box Default::default());
-                            }
-                            &mut *this.right.as_mut().unwrap()
-                        } else {
-                            if this.left.is_none() {
-                                this.left = Some(box Default::default());
-                            }
-                            &mut *this.left.as_mut().unwrap()
-                        };
-                    },
-                    &PathEntry::Ambiguity(ref dis) => {
-                        if iter.peek().is_some( {
-
-                        match this.kind {
-                            None => {
-                                this.kind = Some(Kind::Normal(dis.clone(), v));
-                            }
-                        }
-                    },
-                }
-            }
-        }*/
-
         match self {
             &Op::Insert {
                 at: ref at,
                 node: ref n,
             } => {
+                assert!(at.ends_with_disambiguator());
                 assert!(state.insert(at.clone(), n.clone()).is_none());
                 Ok(())
             },
@@ -332,7 +429,6 @@ impl<A: Clone> super::Operation<State<A>> for Op<A> {
         }
     }
 }
-//pub type State<A> = Node<A>;
 pub type State<A> = BTreeMap<Path, A>;
 pub type Replica<A> = super::Replica<State<A>, OpBasedReplica<Op<A>, State<A>>>;
 
@@ -389,70 +485,291 @@ impl<L, A> Treedoc<L, A>
         }
     }
 
-    pub fn next_available_path_right(&self, prev: Path) -> Path {
-        unimplemented!()
+    fn next_path(&mut self, mut prev: Path, side_first: Side) -> Path {
+        /* TODO
+        struct PathInsertionOrderIter {
+            cache_depth: u64,
+            side_first: Side,
+            root: Path,
+
+            current: Path,
+            last_side: Side,
+        }
+
+        impl<'a> PathInsertionOrderIter {
+        }
+
+
+
+        let mut insertion_iter = PathInsertionOrderIter {
+            cache_depth: (self.len() as f64).log2().ceil() as u64 + 1,
+
+        };
+        let mut iter = self.state
+            .query(move |: state| {
+                state.range(Included(prev), Unbounded)
+            });
+        let (lower_bound_size, _) = iter.size_hint();
+        let mut empty = Vec::with_capacity(lower_bound_size);
+        for (path, _) in*/
+
+        let keep_dis = self.mini_siblings_of(&prev)
+            .count() > 0;
+        if !keep_dis {
+            prev.take_last_disambiguator();
+        }
+
+        let mut next = prev.get_child(side_first);
+        next.last_path_mut()
+            .next = Some((self.next_disambiguator(), None));
+        next
     }
 
-    pub fn insert_at(&mut self, at: Path,
-                     value: A) -> Result<(), TreedocError<L, A>> {
-        unimplemented!()
+    /// March through all of `p`'s paths, removing disambiguators which don't
+    /// disambiguate (ie there isn't any ambiguity).
+    pub fn prune_unambiguous(&self, Path { prefix, next }: Path) -> Path {
+        if next.is_none() { return Path { prefix: prefix, next: next }; }
+
+        let mut result = Path::new_empty();
+        result.push_prefix(&prefix);
+
+        let (dis, next) = next.unwrap();
+        prune(self, &mut result, dis, next);
+        return result;
+
+        fn prune<L, A>(this: &Treedoc<L, A>,
+                       result: &mut Path,
+                       dis: Disambiguator,
+                       mut current: Option<Box<Path>>)
+            where L: super::Log<Op<A>>, A: Clone,
+                  <L as super::Log<Op<A>>>::Error: ::std::error::Error,
+        {
+            debug_assert!(!result.ends_with_disambiguator());
+            let has_siblings = current.is_none() || this
+                .mini_siblings_of(&*result)
+                .count() > 1;
+
+            let next = current
+                .as_mut()
+                .and_then(move |: c| c.next.take() );
+
+            if has_siblings {
+                result.set_last_disambiguator(dis, current);
+            } else {
+                match current {
+                    Some(box Path {
+                        prefix, next: None,
+                    }) => result.push_prefix(&prefix),
+                    _ => unreachable!(),
+                }
+            }
+
+            if let Some((dis, next)) = next {
+                prune(this, result, dis, next);
+            }
+        }
+
     }
-    pub fn insert_right(&mut self,
-                        left: Path, value: A) -> Result<Path, TreedocError<L,A>> {
-        let new_path = self.next_available_path_right(left);
+
+    fn mini_siblings_of(&self, p: &Path) -> Range<Path, A> {
+        let mut p = p.clone();
+        p.take_last_disambiguator();
+
+        let l_bound = p.clone()
+            .get_child(Side::Left);
+        let r_bound = p.get_child(Side::Right);
+        self.state
+            .query(move |: state| {
+                state.range(Excluded(&l_bound),
+                            Excluded(&r_bound))
+            })
+    }
+
+    /// Return an existing path that is n positions right of `path`.
+    pub fn get_path_n_right(&self, path: &Path, n: usize) -> Option<&Path> {
+        self.get_n_right(path, n)
+            .map(|(p, _)| p )
+    }
+    /// Return a reference to an existing path with its associated value n positions right.
+    /// Returns `None` if there is no such position.
+    pub fn get_n_right(&self, path: &Path, n: usize) -> Option<(&Path, &A)> {
+        self.state
+            .query(move |: state| {
+                state.range(Included(path), Unbounded)
+                    .nth(n)
+            })
+    }
+    /// Return an existing path that is n positions right of `path`.
+    pub fn get_path_n_left(&self, path: &Path, n: usize) -> Option<&Path> {
+        self.get_n_left(path, n)
+            .map(|(p, _)| p )
+    }
+    /// Return a reference to an existing path with its associated value n positions right.
+    /// Returns `None` if there is no such position.
+    pub fn get_n_left(&self, path: &Path, n: usize) -> Option<(&Path, &A)> {
+        self.state
+            .query(move |: state| {
+                // reverse_in_place is messing up, so we have to do this manually.
+                let mut iter = state
+                    .range(Unbounded, Included(path));
+                let mut n = n;
+                loop {
+                    let v = iter.next_back();
+                    if v.is_none() { return None; }
+                    else if n == 0 { return v; }
+                    else { n -= 1; }
+                }
+            })
+    }
+
+    pub fn insert_at(&mut self, at: Option<Path>,
+                     value: A) -> Result<(), TreedocError<L, A>> {
+        let at = at
+            .unwrap_or_else(|| {
+                let mut p = Path::new_empty();
+                p.set_last_disambiguator(self.next_disambiguator(), None);
+                p
+            });
+
         let op = Op::Insert {
-            at: new_path.clone(),
+            at: at,
             node: value,
         };
         self.update(op)
-            .map(|()| new_path.clone() )
+    }
+    pub fn insert_right(&mut self,
+                        left: Path, value: A) -> Result<Path, TreedocError<L, A>> {
+        let new_path = self.next_path(left, Side::Right);
+        self.insert_at(Some(new_path.clone()), value)
+            .map(move |: ()| new_path )
+    }
+    pub fn insert_left(&mut self,
+                       right: Path, value: A) -> Result<Path, TreedocError<L, A>> {
+        let new_path = self.next_path(right, Side::Left);
+        self.insert_at(Some(new_path.clone()), value)
+            .map(move |: ()| new_path )
+    }
+
+    pub fn iter(&self) -> btree_map::Values<Path, A> {
+        self.state.query(move |: state| state.values() )
+    }
+
+    pub fn deliver(&mut self,
+                   ops: &[Op<A>]) -> (usize, Result<(), TreedocError<L, A>>) {
+        let mut successful: usize = 0;
+        for op in ops.iter() {
+            let res = self.state
+                .update(op);
+            let res = match res {
+                Ok(()) => self.log
+                    .add_to_log(op.clone())
+                    .map_err(|err| UpdateError::Log(err) ),
+                Err(err) => Err(UpdateError::Op(err)),
+            };
+            if res.is_ok() {
+                successful += 1;
+            } else {
+                return (successful, res);
+            }
+        }
+        return (successful, Ok(()));
     }
 }
 
 #[cfg(test)]
 #[allow(dead_code)]
 mod test {
+    use super::*;
+    use std::cell::Cell;
+    thread_local! { static SITE_COUNTER: Cell<u64> = Cell::new(0) }
+    pub fn next_site_id() -> SiteId {
+        SiteId(SITE_COUNTER.with(|v| {
+            v.set(v.get() + 1);
+            v.get()
+        }))
+    }
+
+    pub trait NextDis {
+        fn next_dis(&self) -> Disambiguator;
+    }
+    impl NextDis for SiteId {
+        fn next_dis(&self) -> Disambiguator {
+            Disambiguator::new_raw(next_dis_counter(),
+                                   self.clone())
+        }
+    }
+
+    thread_local! { static DIS_COUNTER: Cell<u64> = Cell::new(0) }
+    pub fn next_dis_counter() -> u64 {
+        DIS_COUNTER.with(|v| {
+            v.set(v.get() + 1);
+            v.get()
+        })
+    }
+    pub fn next_dis() -> Disambiguator {
+        const SITE: SiteId = SiteId(20);
+        Disambiguator::new_raw(next_dis_counter(),
+                               SITE.clone())
+    }
+
+    pub fn debug_path(p: Path) -> Path {
+        println!("");
+        println!("path iters:");
+        for i in p.iter() {
+            println!("{:?}", i);
+        }
+        p
+    }
+
+    pub fn debug_paths(l: &Path, r: &Path) {
+        println!("");
+        println!("path iters:");
+        let mut li = l.iter();
+        let mut ri = r.iter();
+        let mut i: usize = 0;
+        loop {
+            let l = li.next();
+            let r = ri.next();
+            println!("##{}: left: {:?} right: {:?}", i, l, r);
+            if l.is_none() && r.is_none() { break; }
+            i += 1;
+        }
+    }
+    mod treedoc {
+        use {UpdateError, Log};
+        use super::*;
+        use super::super::*;
+        use test_helpers::*;
+        use std::collections::Bitv;
+        use std::slice::SliceConcatExt;
+
+        type TestTD = Treedoc<DumbLog<Op<String>, State<String>>, String>;
+
+        impl_deliver! { State<String>, Op<String>, TestTD => deliver_td }
+        impl_log_for_state! { State<String>, Op<String> }
+
+        fn new_td() -> TestTD {
+            Treedoc::new(new_dumb_log!(),
+                         next_site_id())
+        }
+
+        #[test]
+        fn insert_at_root() {
+            let mut c = new_td();
+            c.insert_at(None, "test".to_string()).unwrap();
+            let result = {
+                let v: Vec<String> = c.iter()
+                    .map(|v| v.to_string() )
+                    .collect();
+                v.connect(" ")
+            };
+            assert_eq!(result, "test");
+        }
+    }
     mod path {
+        use super::*;
         use super::super::*;
         use std::collections::Bitv;
-        use std::cell::Cell;
-
-        thread_local! { static DIS_COUNTER: Cell<u64> = Cell::new(0) }
-        fn next_dis() -> Disambiguator {
-            const SITE: SiteId = SiteId(20);
-            Disambiguator::new_raw({
-                DIS_COUNTER.with(|v| {
-                    v.set(v.get() + 1);
-                    v.get()
-                })
-            },
-                                   SITE.clone())
-        }
-
-        fn debug_path(p: Path) -> Path {
-            println!("");
-            println!("path iters:");
-            for i in p.iter() {
-                println!("{:?}", i);
-            }
-            p
-        }
-
-        fn debug_paths(l: &Path, r: &Path) {
-            println!("");
-            println!("path iters:");
-            let mut li = l.iter();
-            let mut ri = r.iter();
-            let mut i: usize = 0;
-            loop {
-                let l = li.next();
-                let r = ri.next();
-                println!("left  {}: {:?}", i, l);
-                println!("right {}: {:?}", i, r);
-                if l.is_none() && r.is_none() { break; }
-                i += 1;
-            }
-        }
 
         #[test]
         pub fn simple_height() {
@@ -625,6 +942,71 @@ mod test {
 
             println!("{:?} < {:?}", c, r);
             assert!(c < r);
+        }
+        #[test]
+        fn ends_with_disambiguator() {
+            let c = {
+                let prefix = Bitv::from_elem(3, false);
+                Path::new_raw(prefix, Some((next_dis(), None)))
+            };
+            assert!(c.ends_with_disambiguator());
+        }
+        #[test]
+        fn nested_ends_with_disambiguator() {
+            let c = {
+                let prefix = Bitv::from_elem(3, false);
+                let inner = Path::new_raw(Bitv::from_elem(1, true),
+                                          Some((next_dis(), None)));
+                let inner = box inner;
+                Path::new_raw(prefix, Some((next_dis(),
+                                            Some(inner))))
+            };
+            assert!(c.ends_with_disambiguator());
+        }
+        #[test]
+        fn one_way_distance() {
+            let l = {
+                let prefix = Bitv::from_elem(6, false);
+                Path::new_raw(prefix, None)
+            };
+            let r = {
+                let prefix = Bitv::from_elem(3, false);
+                Path::new_raw(prefix, None)
+            };
+
+            assert_eq!(l.distance(&r), 3);
+            assert_eq!(r.distance(&l), 3);
+        }
+        #[test]
+        fn two_way_distance() {
+            let l = {
+                let mut prefix = Bitv::from_elem(6, false);
+                prefix.set(3, true);
+                Path::new_raw(prefix, None)
+            };
+            let r = {
+                let prefix = Bitv::from_elem(7, false);
+                Path::new_raw(prefix, None)
+            };
+            assert_eq!(l.distance(&r), 7);
+            assert_eq!(r.distance(&l), 7);
+        }
+
+        #[test]
+        fn last_bit() {
+            let c = {
+                let mut prefix = Bitv::from_elem(2, false);
+                prefix.set(1, true);
+                Path::new_raw(prefix, None)
+            };
+            assert_eq!(c.last_bit(), Some(true));
+
+            let c = {
+                let prefix = Bitv::from_elem(2, false);
+                let inner = Path::new_raw(Bitv::from_elem(2, true), None);
+                Path::new_raw(prefix, Some((next_dis(), Some(box inner))))
+            };
+            assert_eq!(c.last_bit(), Some(true));
         }
     }
 }
