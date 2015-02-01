@@ -81,11 +81,6 @@ impl Path {
                     .map(move |: b| &mut (**b) )
             })
     }
-    fn next_box_mut(&mut self) -> Option<&mut Box<Path>> {
-        self.next
-            .as_mut()
-            .and_then(move |: &mut (_, ref mut p)| p.as_mut() )
-    }
 
     pub fn disambiguator(&self) -> Option<&Disambiguator> {
         self.next
@@ -116,12 +111,6 @@ impl Path {
                     .take()
                     .map(move |: (dis, _)| dis )
             })
-    }
-
-    fn take_next(&mut self) -> Option<Box<Path>> {
-        self.next
-            .as_mut()
-            .and_then(move |: &mut (_, ref mut next_opt)| next_opt.take() )
     }
 
     fn push_prefix(&mut self, prefix: &Bitv) {
@@ -258,20 +247,14 @@ impl ChildPath for Option<Path> {
                 prefix: Bitv::from_elem(1, side.to_bit()),
                 next: None,
             },
-            Some(mut p) => {
-                p.last_path_mut()
-                    .prefix
-                    .grow(1, side.to_bit());
-                p
-            }
+            Some(p) => p.get_child(side),
         }
     }
 }
 impl ChildPath for Path {
     fn get_child(mut self, side: Side) -> Path {
-        self.last_path_mut()
-            .prefix
-            .grow(1, side.to_bit());
+        let prefix = Bitv::from_elem(1, side.to_bit());
+        self.push_prefix(&prefix);
         self
     }
 }
@@ -418,13 +401,27 @@ impl<A: Clone> super::Operation<State<A>> for Op<A> {
                 at: ref at,
                 node: ref n,
             } => {
-                assert!(at.ends_with_disambiguator());
-                assert!(state.insert(at.clone(), n.clone()).is_none());
-                Ok(())
+                debug_assert!(at.ends_with_disambiguator());
+                match state.entry(at.clone()) {
+                    btree_map::Entry::Vacant(view) => {
+                        view.insert(n.clone());
+                        Ok(())
+                    }
+                    btree_map::Entry::Occupied(_) => {
+                        Err(OpError::ValueAlreadyPresent)
+                    }
+                }
             },
             &Op::Delete(ref at) => {
-                assert!(state.remove(at).is_some());
-                Ok(())
+                match state.entry(at.clone()) {
+                    btree_map::Entry::Vacant(_) => {
+                        Err(OpError::ValueNotPresent)
+                    }
+                    btree_map::Entry::Occupied(view) => {
+                        view.remove();
+                        Ok(())
+                    }
+                }
             },
         }
     }
@@ -461,7 +458,7 @@ impl<L, A> Treedoc<L, A>
     pub fn log_mut<'a>(&'a mut self) -> &'a mut L { &mut self.log }
     pub fn log_imm<'a>(&'a self) -> &'a L { &self.log }
 
-    fn next_disambiguator(&mut self) -> Disambiguator {
+    pub fn next_disambiguator(&mut self) -> Disambiguator {
         let discounter = self.disambiguator_counter;
         self.disambiguator_counter += 1;
 
@@ -485,7 +482,7 @@ impl<L, A> Treedoc<L, A>
         }
     }
 
-    fn next_path(&mut self, mut prev: Path, side_first: Side) -> Path {
+    fn next_path(&mut self, prev: Path, side_first: Side) -> Path {
         /* TODO
         struct PathInsertionOrderIter {
             cache_depth: u64,
@@ -513,16 +510,9 @@ impl<L, A> Treedoc<L, A>
         let mut empty = Vec::with_capacity(lower_bound_size);
         for (path, _) in*/
 
-        let keep_dis = self.mini_siblings_of(&prev)
-            .count() > 0;
-        if !keep_dis {
-            prev.take_last_disambiguator();
-        }
-
         let mut next = prev.get_child(side_first);
-        next.last_path_mut()
-            .next = Some((self.next_disambiguator(), None));
-        next
+        next.set_last_disambiguator(self.next_disambiguator(), None);
+        self.prune_unambiguous(next)
     }
 
     /// March through all of `p`'s paths, removing disambiguators which don't
@@ -571,7 +561,7 @@ impl<L, A> Treedoc<L, A>
 
     }
 
-    fn mini_siblings_of(&self, p: &Path) -> Range<Path, A> {
+    pub fn mini_siblings_of(&self, p: &Path) -> Range<Path, A> {
         let mut p = p.clone();
         p.take_last_disambiguator();
 
@@ -623,7 +613,7 @@ impl<L, A> Treedoc<L, A>
     }
 
     pub fn insert_at(&mut self, at: Option<Path>,
-                     value: A) -> Result<(), TreedocError<L, A>> {
+                     value: A) -> Result<Path, TreedocError<L, A>> {
         let at = at
             .unwrap_or_else(|| {
                 let mut p = Path::new_empty();
@@ -632,22 +622,35 @@ impl<L, A> Treedoc<L, A>
             });
 
         let op = Op::Insert {
-            at: at,
+            at: at.clone(),
             node: value,
         };
         self.update(op)
+            .map(move |: ()| at )
     }
     pub fn insert_right(&mut self,
                         left: Path, value: A) -> Result<Path, TreedocError<L, A>> {
         let new_path = self.next_path(left, Side::Right);
         self.insert_at(Some(new_path.clone()), value)
-            .map(move |: ()| new_path )
+            .map(move |: _| new_path )
     }
     pub fn insert_left(&mut self,
                        right: Path, value: A) -> Result<Path, TreedocError<L, A>> {
         let new_path = self.next_path(right, Side::Left);
         self.insert_at(Some(new_path.clone()), value)
-            .map(move |: ()| new_path )
+            .map(move |: _| new_path )
+    }
+
+    // TODO: return the value deleted.
+    pub fn delete(&mut self, at: Option<Path>) -> Result<(), TreedocError<L, A>> {
+        let at = at
+            .unwrap_or_else(|| {
+                let mut p = Path::new_empty();
+                p.set_last_disambiguator(self.next_disambiguator(), None);
+                p
+            });
+        let op = Op::Delete(at);
+        self.update(op)
     }
 
     pub fn iter(&self) -> btree_map::Values<Path, A> {
@@ -678,6 +681,7 @@ impl<L, A> Treedoc<L, A>
 
 #[cfg(test)]
 #[allow(dead_code)]
+#[allow(unused_variables)]
 mod test {
     use super::*;
     use std::cell::Cell;
@@ -753,17 +757,131 @@ mod test {
                          next_site_id())
         }
 
-        #[test]
-        fn insert_at_root() {
-            let mut c = new_td();
-            c.insert_at(None, "test".to_string()).unwrap();
+        fn check_td(td: &TestTD, str: &'static str) {
             let result = {
-                let v: Vec<String> = c.iter()
+                let v: Vec<String> = td.iter()
                     .map(|v| v.to_string() )
                     .collect();
                 v.connect(" ")
             };
-            assert_eq!(result, "test");
+            assert_eq!(result, str);
+        }
+
+        #[test]
+        fn insert_at_root() {
+            let mut c = new_td();
+            c.insert_at(None, "test".to_string()).unwrap();
+            check_td(&c, "test");
+        }
+        #[test]
+        fn insert_right() {
+            let mut c = new_td();
+            let p = c.insert_at(None, "test".to_string()).unwrap();
+            c.insert_right(p, "test2".to_string()).unwrap();
+            check_td(&c, "test test2");
+        }
+        #[test]
+        fn insert_left() {
+            let mut c = new_td();
+            let p = c.insert_at(None, "test".to_string()).unwrap();
+            c.insert_left(p, "test2".to_string()).unwrap();
+            check_td(&c, "test2 test");
+        }
+        #[test]
+        fn delete() {
+            let mut c = new_td();
+            let p1 = c.insert_at(None, "test".to_string()).unwrap();
+            let p2 = c.insert_left(p1.clone(), "test2".to_string()).unwrap();
+            c.delete(Some(p1)).unwrap();
+            check_td(&c, "test2");
+        }
+        #[test]
+        fn inserts_commute() {
+            let mut r = new_td();
+            let mut l = new_td();
+
+            r.insert_at(None, "test_right".to_string()).unwrap();
+            l.insert_at(None, "test_left".to_string()).unwrap();
+
+            let ll = l.log_imm().clone();
+            deliver_td(r.log_imm(), 0, None, &mut l);
+            deliver_td(&ll, 0, None, &mut r);
+
+            const RESULT: &'static str = "test_right test_left";
+
+            check_td(&r, RESULT);
+            check_td(&l, RESULT);
+        }
+        #[test]
+        fn prune_unambiguous() {
+            let mut r = new_td();
+            let mut l = new_td();
+
+            let p1 = r.insert_at(None, "test_right".to_string())
+                .unwrap();
+            l.insert_at(None, "test_left".to_string()).unwrap();
+
+            let ll = l.log_imm().clone();
+            deliver_td(r.log_imm(), 0, None, &mut l);
+            deliver_td(&ll, 0, None, &mut r);
+
+            const RESULT: &'static str = "test_right test_left";
+
+            check_td(&r, RESULT);
+            check_td(&l, RESULT);
+
+            let p2 = r.insert_right(p1, "test_right-right".to_string()).unwrap();
+            assert_eq!(p2.links(), 2);
+            check_td(&r, "test_right test_right-right test_left");
+        }
+        #[test]
+        fn get_n_left_or_right() {
+            // left:
+            {
+                let mut c = new_td();
+                let p1 = c.insert_at(None, "center".to_string())
+                    .unwrap();
+                let p2 = c.insert_left(p1.clone(), "left1".to_string()).unwrap();
+                let p3 = c.insert_left(p2.clone(), "left2".to_string()).unwrap();
+                let p4 = c.insert_left(p3, "left3".to_string()).unwrap();
+
+                let right_2 = c.get_n_right(&p4, 2)
+                    .map(|(p, v)| (p, v.as_slice()) );
+                assert_eq!(right_2, Some((&p2, "left1")));
+                let p2_b = right_2.map(|(p, _)| p ).unwrap();
+                let p1_b = c.get_path_n_right(p2_b, 1).unwrap();
+                assert_eq!(p1_b, &p1);
+
+                assert_eq!(c.get_n_right(&p4, 10), None);
+            }
+
+            // right:
+            {
+                let mut c = new_td();
+                let p1 = c.insert_at(None, "center".to_string())
+                    .unwrap();
+                let p2 = c.insert_right(p1.clone(), "right1".to_string()).unwrap();
+                let p3 = c.insert_right(p2.clone(), "right2".to_string()).unwrap();
+                let p4 = c.insert_right(p3, "right3".to_string()).unwrap();
+
+                let left_2 = c.get_n_left(&p4, 2)
+                    .map(|(p, v)| (p, v.as_slice()) );
+                assert_eq!(left_2, Some((&p2, "right1")));
+                let p2_b = left_2.map(|(p, _)| p ).unwrap();
+                let p1_b = c.get_path_n_left(p2_b, 1).unwrap();
+                assert_eq!(p1_b, &p1);
+
+                assert_eq!(c.get_n_left(&p4, 10), None);
+            }
+        }
+
+        #[test]
+        fn delete_before_insert() {
+            let mut c = new_td();
+            assert!(match c.delete(None) {
+                Err(UpdateError::Op(OpError::ValueNotPresent)) => true,
+                _ => false,
+            });
         }
     }
     mod path {
