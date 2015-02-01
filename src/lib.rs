@@ -2,10 +2,9 @@
 //!
 //! This is a WIP, so expect that it might change in incompatible ways.
 
-#![experimental]
-#![allow(unstable)]
 #![allow(non_shorthand_field_patterns)]
 #![feature(box_syntax)]
+#![feature(core, hash, collections)]
 
 extern crate uuid;
 
