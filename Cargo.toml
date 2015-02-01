@@ -1,6 +1,6 @@
 [package]
 
-name = "swarm-rs"
+name = "swarm"
 version = "0.0.1"
 authors = ["Richard Diamond <wichard@vitalitystudios.com>"]
 
