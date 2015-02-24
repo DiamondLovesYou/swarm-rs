@@ -94,6 +94,11 @@ impl Path {
             })
     }
 
+    #[cfg(test)]
+    pub fn _test_take_last_disambiguator(&mut self) {
+        self.take_last_disambiguator();
+    }
+
     fn take_last_disambiguator(&mut self) -> Option<Disambiguator> {
         self.next
             .as_mut()
@@ -483,19 +488,20 @@ impl<L, A> Treedoc<L, A>
     pub fn get_next_empty_path(&mut self, parent: Option<Path>, side: Side) -> Path {
         match parent {
             None => {
-                let mut p = Path::new_empty();
-                p.set_last_disambiguator(self.next_disambiguator(), None);
+                let p = Path::new_empty();
                 self.get_next_empty_path(Some(p), side)
             },
             Some(mut parent) => {
-                let mut side = side;
+                self.take_last_disambiguator_of_only_child(&mut parent);
+                let mut parent = self.prune_unambiguous(parent);
                 loop {
-                    if !self.contains(&parent) {
+                    parent = parent.get_child(side);
+
+                    if self.mini_siblings_of_inner(parent.clone()).next().is_none() {
+                        parent.set_last_disambiguator(self.next_disambiguator(),
+                                                      None);
                         return parent;
                     }
-
-                    parent = parent.get_child(side);
-                    side = side.opposite_side();
                 }
             },
         }
@@ -580,9 +586,25 @@ impl<L, A> Treedoc<L, A>
 
     }
 
+
+    fn take_last_disambiguator_of_only_child(&self, p: &mut Path) ->
+        Option<Disambiguator>
+    {
+        let mut dis = p.take_last_disambiguator();
+        if dis.is_none() { return None; }
+        if self.mini_siblings_of_inner(p.clone()).count() > 1 {
+            p.set_last_disambiguator(dis.take().unwrap(), None);
+        }
+        return dis;
+    }
+
     pub fn mini_siblings_of(&self, p: &Path) -> Range<Path, A> {
         let mut p = p.clone();
         p.take_last_disambiguator();
+        self.mini_siblings_of_inner(p)
+    }
+    fn mini_siblings_of_inner(&self, p: Path) -> Range<Path, A> {
+        debug_assert!(!p.ends_with_disambiguator());
 
         let l_bound = p.clone()
             .get_child(Side::Left);
@@ -772,7 +794,6 @@ mod test {
         use {UpdateError, Log, NullError};
         use super::super::*;
         use test_helpers::*;
-        use std::collections::BitVec;
         use std::slice::SliceConcatExt;
 
         type TestTD = Treedoc<DumbLog<Op<String>>, String>;
@@ -917,6 +938,20 @@ mod test {
                 Err(UpdateError::Op(OpError::ValueNotPresent)) => true,
                 _ => false,
             });
+        }
+
+        #[test]
+        fn get_next_empty() {
+            let mut c = new_td();
+            let root = c.insert_at(None, "t-root".to_string()).unwrap();
+            let mut to_remove = c.insert_right(root.clone(), "tr1".to_string())
+                .unwrap();
+            c.insert_right(to_remove.clone(), "tr2".to_string()).unwrap();
+            c.delete(Some(to_remove.clone())).unwrap();
+            let mut empty = c.get_next_empty_path(Some(root), Side::Right);
+            empty._test_take_last_disambiguator();
+            to_remove._test_take_last_disambiguator();
+            assert_eq!(empty, to_remove);
         }
     }
     mod path {
