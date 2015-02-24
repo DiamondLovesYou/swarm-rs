@@ -1,6 +1,6 @@
 use {OpBasedReplica, UpdateError};
-use std::collections::bitv;
-use std::collections::{Bitv, BTreeMap};
+use std::collections::bit_vec;
+use std::collections::{BitVec, BTreeMap};
 use std::collections::btree_map::{self, Range};
 use std::collections::Bound::{Included, Excluded, Unbounded};
 use std::cmp::{Ordering};
@@ -8,12 +8,7 @@ use std::default::Default;
 
 pub use super::set::OpError;
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub struct SiteId(pub u64);
-
-pub trait SiteIdentifier {
-    fn site_id(&self) -> SiteId;
-}
+pub use super::SiteId;
 
 #[derive(Eq, Ord, PartialEq, PartialOrd, Clone, Copy, Debug, Hash)]
 pub struct Disambiguator {
@@ -33,19 +28,19 @@ impl Disambiguator {
 #[derive(Debug, Clone, Hash)]
 pub struct Path {
     // False is left, true is right.
-    prefix: Bitv,
+    prefix: BitVec,
     next: Option<(Disambiguator, Option<Box<Path>>)>,
 }
 impl Path {
     pub fn new_empty() -> Path {
         Path {
-            prefix: Bitv::new(),
+            prefix: BitVec::new(),
             next: None,
         }
     }
 
     #[cfg(test)]
-    pub fn new_raw(prefix: Bitv,
+    pub fn new_raw(prefix: BitVec,
                    next: Option<(Disambiguator, Option<Box<Path>>)>) -> Path {
         if let Some((_, Some(ref p))) = next {
             assert!(!p.empty());
@@ -68,29 +63,29 @@ impl Path {
     pub fn next_imm(&self) -> Option<&Path> {
         self.next
             .as_ref()
-            .and_then(move |: &(_, ref v)| {
+            .and_then(move |&(_, ref v)| {
                 v.as_ref()
-                    .map(move |: v| &(**v) )
+                    .map(move |v| &(**v) )
             })
     }
     fn next_mut(&mut self) -> Option<&mut Path> {
         self.next
             .as_mut()
-            .and_then(move |: &mut (_, ref mut p)| {
+            .and_then(move |&mut (_, ref mut p)| {
                 p.as_mut()
-                    .map(move |: b| &mut (**b) )
+                    .map(move |b| &mut (**b) )
             })
     }
 
     pub fn disambiguator(&self) -> Option<&Disambiguator> {
         self.next
             .as_ref()
-            .map(move |: &(ref dis, _)| dis )
+            .map(move |&(ref dis, _)| dis )
     }
     pub fn last_disambiguator(&self) -> Option<&Disambiguator> {
         self.next
             .as_ref()
-            .and_then(move |: &(ref dis, ref n)| {
+            .and_then(move |&(ref dis, ref n)| {
                 if let &Some(ref n) = n {
                     n.last_disambiguator()
                 } else {
@@ -102,18 +97,18 @@ impl Path {
     fn take_last_disambiguator(&mut self) -> Option<Disambiguator> {
         self.next
             .as_mut()
-            .and_then(move |: &mut (_, ref mut n)| {
+            .and_then(move |&mut (_, ref mut n)| {
                 n.as_mut()
-                    .and_then(move |: n| n.take_last_disambiguator() )
+                    .and_then(move |n| n.take_last_disambiguator() )
             })
-            .or_else(move |:| {
+            .or_else(move || {
                 self.next
                     .take()
-                    .map(move |: (dis, _)| dis )
+                    .map(move |(dis, _)| dis )
             })
     }
 
-    fn push_prefix(&mut self, prefix: &Bitv) {
+    fn push_prefix(&mut self, prefix: &BitVec) {
         if let Some(next) = self.next_mut() {
             next.push_prefix(prefix);
             return;
@@ -133,7 +128,7 @@ impl Path {
     fn set_last_disambiguator(&mut self, dis: Disambiguator, p: Option<Box<Path>>) {
         match self.next {
             None | Some((_, None)) => {
-                debug_assert!(p.as_ref().map(move |: p| !p.empty() ).unwrap_or(true));
+                debug_assert!(p.as_ref().map(move |p| !p.empty() ).unwrap_or(true));
                 self.next = Some((dis, p));
             }
             Some((_, Some(ref mut next))) => {
@@ -244,7 +239,7 @@ impl ChildPath for Option<Path> {
     fn get_child(self, side: Side) -> Path {
         match self {
             None => Path {
-                prefix: Bitv::from_elem(1, side.to_bit()),
+                prefix: BitVec::from_elem(1, side.to_bit()),
                 next: None,
             },
             Some(p) => p.get_child(side),
@@ -253,7 +248,7 @@ impl ChildPath for Option<Path> {
 }
 impl ChildPath for Path {
     fn get_child(mut self, side: Side) -> Path {
-        let prefix = Bitv::from_elem(1, side.to_bit());
+        let prefix = BitVec::from_elem(1, side.to_bit());
         self.push_prefix(&prefix);
         self
     }
@@ -337,7 +332,7 @@ pub enum PathEntry<'a> {
     Ambiguity(&'a Disambiguator),
 }
 pub struct PathEntries<'a> {
-    prefix_iter: bitv::Iter<'a>,
+    prefix_iter: bit_vec::Iter<'a>,
     next: Option<&'a (Disambiguator, Option<Box<Path>>)>,
 }
 impl<'a> Iterator for PathEntries<'a> {
@@ -431,13 +426,16 @@ pub type Replica<A> = super::Replica<State<A>, OpBasedReplica<Op<A>, State<A>>>;
 
 pub type TreedocError<L, A> = UpdateError<<L as super::Log<Op<A>>>::Error, OpError>;
 
+pub type Iter<'a, A> = btree_map::Iter<'a, Path, A>;
+pub type ValuesIter<'a, A> = btree_map::Values<'a, Path, A>;
+
+#[derive(Clone)]
 pub struct Treedoc<L, A>
     where L: super::Log<Op<A>>,
           A: Clone,
 {
     // a.k.a. the tree root
     state: Replica<A>,
-    site: SiteId,
     disambiguator_counter: u64,
     log: L,
 }
@@ -446,10 +444,9 @@ impl<L, A> Treedoc<L, A>
           A: Clone,
           <L as super::Log<Op<A>>>::Error: ::std::error::Error,
 {
-    pub fn new(log: L, site: SiteId) -> Treedoc<L, A> {
+    pub fn new(log: L) -> Treedoc<L, A> {
         Treedoc {
             state: Default::default(),
-            site: site,
             disambiguator_counter: 0,
             log: log,
         }
@@ -463,7 +460,7 @@ impl<L, A> Treedoc<L, A>
         self.disambiguator_counter += 1;
 
         Disambiguator {
-            site: self.site.clone(),
+            site: self.log.get_site_id().clone(),
             counter: discounter,
         }
     }
@@ -479,6 +476,28 @@ impl<L, A> Treedoc<L, A>
                     .map_err(|err| UpdateError::Log(err) )
             },
             err => err,
+        }
+    }
+
+    /// Gets the closest path the `side` of `parent`.
+    pub fn get_next_empty_path(&mut self, parent: Option<Path>, side: Side) -> Path {
+        match parent {
+            None => {
+                let mut p = Path::new_empty();
+                p.set_last_disambiguator(self.next_disambiguator(), None);
+                self.get_next_empty_path(Some(p), side)
+            },
+            Some(mut parent) => {
+                let mut side = side;
+                loop {
+                    if !self.contains(&parent) {
+                        return parent;
+                    }
+
+                    parent = parent.get_child(side);
+                    side = side.opposite_side();
+                }
+            },
         }
     }
 
@@ -541,7 +560,7 @@ impl<L, A> Treedoc<L, A>
 
             let next = current
                 .as_mut()
-                .and_then(move |: c| c.next.take() );
+                .and_then(move |c| c.next.take() );
 
             if has_siblings {
                 result.set_last_disambiguator(dis, current);
@@ -569,7 +588,7 @@ impl<L, A> Treedoc<L, A>
             .get_child(Side::Left);
         let r_bound = p.get_child(Side::Right);
         self.state
-            .query(move |: state| {
+            .query(move |state| {
                 state.range(Excluded(&l_bound),
                             Excluded(&r_bound))
             })
@@ -584,7 +603,7 @@ impl<L, A> Treedoc<L, A>
     /// Returns `None` if there is no such position.
     pub fn get_n_right(&self, path: &Path, n: usize) -> Option<(&Path, &A)> {
         self.state
-            .query(move |: state| {
+            .query(move |state| {
                 state.range(Included(path), Unbounded)
                     .nth(n)
             })
@@ -598,7 +617,7 @@ impl<L, A> Treedoc<L, A>
     /// Returns `None` if there is no such position.
     pub fn get_n_left(&self, path: &Path, n: usize) -> Option<(&Path, &A)> {
         self.state
-            .query(move |: state| {
+            .query(move |state| {
                 // reverse_in_place is messing up, so we have to do this manually.
                 let mut iter = state
                     .range(Unbounded, Included(path));
@@ -626,19 +645,19 @@ impl<L, A> Treedoc<L, A>
             node: value,
         };
         self.update(op)
-            .map(move |: ()| at )
+            .map(move |()| at )
     }
     pub fn insert_right(&mut self,
                         left: Path, value: A) -> Result<Path, TreedocError<L, A>> {
         let new_path = self.next_path(left, Side::Right);
         self.insert_at(Some(new_path.clone()), value)
-            .map(move |: _| new_path )
+            .map(move |_| new_path )
     }
     pub fn insert_left(&mut self,
                        right: Path, value: A) -> Result<Path, TreedocError<L, A>> {
         let new_path = self.next_path(right, Side::Left);
         self.insert_at(Some(new_path.clone()), value)
-            .map(move |: _| new_path )
+            .map(move |_| new_path )
     }
 
     // TODO: return the value deleted.
@@ -653,8 +672,25 @@ impl<L, A> Treedoc<L, A>
         self.update(op)
     }
 
-    pub fn iter(&self) -> btree_map::Values<Path, A> {
-        self.state.query(move |: state| state.values() )
+    /// Checks for the existance of the path at `path`.
+    pub fn contains(&self, path: &Path) -> bool {
+        if !path.ends_with_disambiguator() {
+            self.mini_siblings_of(path)
+                .next().is_some()
+        } else {
+            self.state.query(move |s| s.contains_key(path) )
+        }
+    }
+
+    pub fn values(&self) -> ValuesIter<A> {
+        self.state.query(move |state| state.values() )
+    }
+    pub fn iter(&self) -> Iter<A> {
+        self.state.query(move |state| state.iter() )
+    }
+
+    pub fn len(&self) -> usize {
+        self.state.query(move |s| s.len() )
     }
 
     pub fn deliver(&mut self,
@@ -685,13 +721,6 @@ impl<L, A> Treedoc<L, A>
 mod test {
     use super::*;
     use std::cell::Cell;
-    thread_local! { static SITE_COUNTER: Cell<u64> = Cell::new(0) }
-    pub fn next_site_id() -> SiteId {
-        SiteId(SITE_COUNTER.with(|v| {
-            v.set(v.get() + 1);
-            v.get()
-        }))
-    }
 
     pub trait NextDis {
         fn next_dis(&self) -> Disambiguator;
@@ -740,26 +769,24 @@ mod test {
         }
     }
     mod treedoc {
-        use {UpdateError, Log};
-        use super::*;
+        use {UpdateError, Log, NullError};
         use super::super::*;
         use test_helpers::*;
-        use std::collections::Bitv;
+        use std::collections::BitVec;
         use std::slice::SliceConcatExt;
 
-        type TestTD = Treedoc<DumbLog<Op<String>, State<String>>, String>;
+        type TestTD = Treedoc<DumbLog<Op<String>>, String>;
 
         impl_deliver! { State<String>, Op<String>, TestTD => deliver_td }
-        impl_log_for_state! { State<String>, Op<String> }
+        impl_log_for_state! { Op<String> }
 
         fn new_td() -> TestTD {
-            Treedoc::new(new_dumb_log!(),
-                         next_site_id())
+            Treedoc::new(new_dumb_log!())
         }
 
         fn check_td(td: &TestTD, str: &'static str) {
             let result = {
-                let v: Vec<String> = td.iter()
+                let v: Vec<String> = td.values()
                     .map(|v| v.to_string() )
                     .collect();
                 v.connect(" ")
@@ -786,6 +813,14 @@ mod test {
             let p = c.insert_at(None, "test".to_string()).unwrap();
             c.insert_left(p, "test2".to_string()).unwrap();
             check_td(&c, "test2 test");
+        }
+        #[test]
+        fn insert_left_twice() {
+            let mut c = new_td();
+            let p = c.insert_at(None, "t1".to_string()).unwrap();
+            c.insert_left(p.clone(), "t3".to_string()).unwrap();
+            c.insert_left(p, "t2".to_string()).unwrap();
+            check_td(&c, "t3 t2 t1");
         }
         #[test]
         fn delete() {
@@ -887,11 +922,11 @@ mod test {
     mod path {
         use super::*;
         use super::super::*;
-        use std::collections::Bitv;
+        use std::collections::BitVec;
 
         #[test]
         pub fn simple_height() {
-            let mut prefix = Bitv::from_elem(3, false);
+            let mut prefix = BitVec::from_elem(3, false);
             prefix.set(2, true);
             let p = Path::new_raw
                 (prefix, None);
@@ -899,7 +934,7 @@ mod test {
         }
         #[test]
         pub fn disambiguator_height() {
-            let mut prefix = Bitv::from_elem(3, false);
+            let mut prefix = BitVec::from_elem(3, false);
             prefix.set(1, true);
             let dis = Disambiguator::new_raw(10, SiteId(20));
             let p = Path::new_raw(prefix, Some((dis, None)));
@@ -907,7 +942,7 @@ mod test {
         }
         #[test]
         pub fn nested_disambiguator_height() {
-            let prefix = Bitv::from_elem(3, false);
+            let prefix = BitVec::from_elem(3, false);
             let dis1 = Disambiguator::new_raw(0, SiteId(20));
             let dis2 = Disambiguator::new_raw(1, SiteId(20));
             let nested = box Path::new_raw(prefix.clone(), Some((dis2, None)));
@@ -917,11 +952,11 @@ mod test {
         #[test]
         pub fn prefix_cmp_neq() {
             let l = {
-                let prefix = Bitv::from_elem(3, false);
+                let prefix = BitVec::from_elem(3, false);
                 Path::new_raw(prefix, None)
             };
             let r = {
-                let prefix = Bitv::from_elem(3, true);
+                let prefix = BitVec::from_elem(3, true);
                 Path::new_raw(prefix, None)
             };
             assert!(l != r);
@@ -929,12 +964,12 @@ mod test {
         #[test]
         pub fn prefix_cmp_eq() {
             let l = {
-                let mut prefix = Bitv::from_elem(3, false);
+                let mut prefix = BitVec::from_elem(3, false);
                 prefix.set(2, true);
                 Path::new_raw(prefix, None)
             };
             let r = {
-                let mut prefix = Bitv::from_elem(3, false);
+                let mut prefix = BitVec::from_elem(3, false);
                 prefix.set(2, true);
                 Path::new_raw(prefix, None)
             };
@@ -944,19 +979,19 @@ mod test {
         #[test]
         pub fn prefix_cmp() {
             let l = {
-                let mut prefix = Bitv::from_elem(3, false);
+                let mut prefix = BitVec::from_elem(3, false);
                 prefix.set(2, true);
                 Path::new_raw(prefix, None)
             };
             let r = {
-                let prefix = Bitv::from_elem(3, false);
+                let prefix = BitVec::from_elem(3, false);
                 Path::new_raw(prefix, None)
             };
 
             assert!(l > r);
 
             let r = {
-                let mut prefix = Bitv::from_elem(3, false);
+                let mut prefix = BitVec::from_elem(3, false);
                 prefix.set(1, true);
                 Path::new_raw(prefix, None)
             };
@@ -966,12 +1001,12 @@ mod test {
         #[test]
         pub fn prefix_disambiguator_cmp() {
             let l = {
-                let mut prefix = Bitv::from_elem(3, false);
+                let mut prefix = BitVec::from_elem(3, false);
                 prefix.set(2, true);
                 Path::new_raw(prefix, None)
             };
             let r = {
-                let mut prefix = Bitv::from_elem(3, false);
+                let mut prefix = BitVec::from_elem(3, false);
                 prefix.set(2, true);
                 Path::new_raw(prefix, Some((next_dis(), None)))
             };
@@ -984,12 +1019,12 @@ mod test {
         #[test]
         pub fn disambiguator_cmp_center() {
             let l = {
-                let mut prefix = Bitv::from_elem(3, false);
+                let mut prefix = BitVec::from_elem(3, false);
                 prefix.set(2, true);
                 Path::new_raw(prefix, Some((next_dis(), None)))
             };
             let r = {
-                let mut prefix = Bitv::from_elem(4, false);
+                let mut prefix = BitVec::from_elem(4, false);
                 prefix.set(2, true);
                 Path::new_raw(prefix, None)
             };
@@ -997,12 +1032,12 @@ mod test {
             assert!(r < l);
 
             let l = {
-                let mut prefix = Bitv::from_elem(3, false);
+                let mut prefix = BitVec::from_elem(3, false);
                 prefix.set(2, true);
                 Path::new_raw(prefix, Some((next_dis(), None)))
             };
             let r = {
-                let mut prefix = Bitv::from_elem(4, false);
+                let mut prefix = BitVec::from_elem(4, false);
                 prefix.set(2, true);
                 prefix.set(3, true);
                 Path::new_raw(prefix, None)
@@ -1016,14 +1051,14 @@ mod test {
         pub fn disambiguator_with_suffix() {
             // it's impossible to insert a child node before the parent mininode.
             let l = {
-                let mut prefix = Bitv::from_elem(3, false);
+                let mut prefix = BitVec::from_elem(3, false);
                 prefix.set(2, true);
                 Path::new_raw(prefix, None)
             };
             let r = {
-                let mut prefix = Bitv::from_elem(3, false);
+                let mut prefix = BitVec::from_elem(3, false);
                 prefix.set(2, true);
-                let suffix = Bitv::from_elem(2, false);
+                let suffix = BitVec::from_elem(2, false);
                 let suffix = Path::new_raw(suffix, None);
                 Path::new_raw(prefix, Some((next_dis(), Some(box suffix))))
             };
@@ -1033,15 +1068,15 @@ mod test {
         pub fn disambiguator_cmp() {
             let c_dis = next_dis();
             let c = {
-                let mut prefix = Bitv::from_elem(3, false);
+                let mut prefix = BitVec::from_elem(3, false);
                 prefix.set(2, true);
                 Path::new_raw(prefix, Some((c_dis.clone(), None)))
             };
 
             let l = {
-                let mut prefix = Bitv::from_elem(3, false);
+                let mut prefix = BitVec::from_elem(3, false);
                 prefix.set(2, true);
-                let inner = box Path::new_raw(Bitv::from_elem(1, false),
+                let inner = box Path::new_raw(BitVec::from_elem(1, false),
                                               None);
                 Path::new_raw(prefix, Some((c_dis.clone(), Some(inner))))
             };
@@ -1051,9 +1086,9 @@ mod test {
             assert!(l < c);
 
             let r = {
-                let mut prefix = Bitv::from_elem(3, false);
+                let mut prefix = BitVec::from_elem(3, false);
                 prefix.set(2, true);
-                let inner = box Path::new_raw(Bitv::from_elem(1, true),
+                let inner = box Path::new_raw(BitVec::from_elem(1, true),
                                               None);
                 Path::new_raw(prefix, Some((c_dis.clone(), Some(inner))))
             };
@@ -1064,7 +1099,7 @@ mod test {
         #[test]
         fn ends_with_disambiguator() {
             let c = {
-                let prefix = Bitv::from_elem(3, false);
+                let prefix = BitVec::from_elem(3, false);
                 Path::new_raw(prefix, Some((next_dis(), None)))
             };
             assert!(c.ends_with_disambiguator());
@@ -1072,8 +1107,8 @@ mod test {
         #[test]
         fn nested_ends_with_disambiguator() {
             let c = {
-                let prefix = Bitv::from_elem(3, false);
-                let inner = Path::new_raw(Bitv::from_elem(1, true),
+                let prefix = BitVec::from_elem(3, false);
+                let inner = Path::new_raw(BitVec::from_elem(1, true),
                                           Some((next_dis(), None)));
                 let inner = box inner;
                 Path::new_raw(prefix, Some((next_dis(),
@@ -1084,11 +1119,11 @@ mod test {
         #[test]
         fn one_way_distance() {
             let l = {
-                let prefix = Bitv::from_elem(6, false);
+                let prefix = BitVec::from_elem(6, false);
                 Path::new_raw(prefix, None)
             };
             let r = {
-                let prefix = Bitv::from_elem(3, false);
+                let prefix = BitVec::from_elem(3, false);
                 Path::new_raw(prefix, None)
             };
 
@@ -1098,12 +1133,12 @@ mod test {
         #[test]
         fn two_way_distance() {
             let l = {
-                let mut prefix = Bitv::from_elem(6, false);
+                let mut prefix = BitVec::from_elem(6, false);
                 prefix.set(3, true);
                 Path::new_raw(prefix, None)
             };
             let r = {
-                let prefix = Bitv::from_elem(7, false);
+                let prefix = BitVec::from_elem(7, false);
                 Path::new_raw(prefix, None)
             };
             assert_eq!(l.distance(&r), 7);
@@ -1113,15 +1148,15 @@ mod test {
         #[test]
         fn last_bit() {
             let c = {
-                let mut prefix = Bitv::from_elem(2, false);
+                let mut prefix = BitVec::from_elem(2, false);
                 prefix.set(1, true);
                 Path::new_raw(prefix, None)
             };
             assert_eq!(c.last_bit(), Some(true));
 
             let c = {
-                let prefix = Bitv::from_elem(2, false);
-                let inner = Path::new_raw(Bitv::from_elem(2, true), None);
+                let prefix = BitVec::from_elem(2, false);
+                let inner = Path::new_raw(BitVec::from_elem(2, true), None);
                 Path::new_raw(prefix, Some((next_dis(), Some(box inner))))
             };
             assert_eq!(c.last_bit(), Some(true));

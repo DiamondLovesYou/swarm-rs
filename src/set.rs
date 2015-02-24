@@ -1,6 +1,6 @@
 use super::{Operation, Replica, UpdateError};
 use super::{OpBasedReplica, StateBasedReplica};
-use std::borrow::BorrowFrom;
+use std::borrow::Borrow;
 use std::collections::{btree_map, BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -89,7 +89,7 @@ pub type UniqueState<A> = BTreeMap<A, bool>;
 pub type UniqueReplica<A> =
     Replica<UniqueState<A>, OpBasedReplica<Op<A>, UniqueState<A>>>;
 // An Op-based CRDT.
-#[derive(Clone, Show)]
+#[derive(Clone, Debug)]
 pub struct Unique<L, A>
     where L: super::Log<Op<A>>, A: Ord + Clone,
 {
@@ -104,7 +104,7 @@ impl<LHSL, RHSL, A> PartialEq<Unique<RHSL, A>> for Unique<LHSL, A>
 {
     fn eq(&self, rhs: &Unique<RHSL, A>) -> bool {
         self.state.query(move |&: lhs| {
-            lhs.eq(rhs.state.query(move |: state| state ))
+            lhs.eq(rhs.state.query(move |state| state ))
         })
     }
 }
@@ -133,7 +133,7 @@ impl<Log, Atom> Unique<Log, Atom>
     }
 
     // Return a forward only iterator over the none tombstoned elements in this set.
-    pub fn iter(&self) -> iter::FilterMap<(&Atom, &bool), &Atom, btree_map::Iter<Atom, bool>, for<'a> fn((&'a Atom, &bool)) -> Option<&'a Atom>> {
+    pub fn iter(&self) -> iter::FilterMap<btree_map::Iter<Atom, bool>, for<'a> fn((&'a Atom, &bool)) -> Option<&'a Atom>> {
         fn filter_map<'a, A>((a, &tomb): (&'a A, &bool)) -> Option<&'a A> {
             if !tomb { Some(a) }
             else     { None    }
@@ -169,7 +169,7 @@ impl<Log, Atom> Unique<Log, Atom>
 
     // Note this is not what you would expect, it will also include dead set members.
     pub fn len(&self) -> usize {
-        self.state.query(move |: state: &UniqueState<Atom>| state.len() )
+        self.state.query(move |state: &UniqueState<Atom>| state.len() )
     }
 
     // Deliver an upstream operation to this replica. Returns the
@@ -236,7 +236,7 @@ pub type PNState<A> = BTreeMap<A, (u64, u64)>;
 pub type PNReplica<A> =
     Replica<PNState<A>, OpBasedReplica<Op<A>, PNState<A>>>;
 // A multi value set.
-#[derive(Clone, Show)]
+#[derive(Clone, Debug)]
 pub struct PN<L, A>
     where L: super::Log<Op<A>>,
           A: Ord + Clone,
@@ -251,7 +251,7 @@ impl<LHSL, RHSL, A> PartialEq<PN<RHSL, A>> for PN<LHSL, A>
 {
     fn eq(&self, rhs: &PN<RHSL, A>) -> bool {
         self.state.query(move |&: lhs| {
-            lhs.eq(rhs.state.query(move |: state| state ))
+            lhs.eq(rhs.state.query(move |state| state ))
         })
     }
 }
@@ -287,7 +287,7 @@ impl<L, A> PN<L, A>
     }
 
     // Return a forward only iterator over the none tombstoned elements in this set.
-    pub fn iter(&self) -> iter::FilterMap<(&A, &(u64, u64)), &A, btree_map::Iter<A, (u64, u64)>, for<'a> fn((&'a A, &(u64, u64))) -> Option<&'a A>> {
+    pub fn iter(&self) -> iter::FilterMap<btree_map::Iter<A, (u64, u64)>, for<'a> fn((&'a A, &(u64, u64))) -> Option<&'a A>> {
         fn filter_map<'a, A>((a, &(added, removed)): (&'a A, &(u64, u64))) -> Option<&'a A> {
             if added > removed { Some(a) }
             else               { None    }
@@ -322,7 +322,7 @@ impl<L, A> PN<L, A>
     // Note this count includes elements that are technically removed.
     pub fn len(&self) -> usize {
         self.state
-            .query(move |: state| {
+            .query(move |state| {
                 state.len()
             })
     }
@@ -375,12 +375,12 @@ impl<Atom> GrowOnlySetState<Atom> where Atom: Ord + Send {
 
     pub fn add(&mut self, v: Atom) -> &BTreeSet<Atom> {
         self.inner_mut()
-            .mutate(move |: state: &mut BTreeSet<Atom>| {
+            .mutate(move |state: &mut BTreeSet<Atom>| {
                 state.insert(v);
             })
     }
 
-    pub fn lookup<T: ?Sized>(&self, v: &T) -> bool where T: BorrowFrom<Atom>, T: Ord {
+    pub fn lookup<T: ?Sized>(&self, v: &T) -> bool where Atom: Borrow<T>, T: Ord {
         self.inner_imm()
             .query(move |&: state: &BTreeSet<Atom>| {
                 state.contains(v)
@@ -389,7 +389,7 @@ impl<Atom> GrowOnlySetState<Atom> where Atom: Ord + Send {
 
     pub fn len(&self) -> usize {
         self.inner_imm()
-            .query(move |: state: &BTreeSet<Atom>| {
+            .query(move |state: &BTreeSet<Atom>| {
                 state.len()
             })
     }
@@ -536,7 +536,7 @@ impl<L, A> OR<L, A>
         let element = ORElement(v, id);
         let op = Op::Add(element.clone());
         self.update(op)
-            .map(move |:()| element )
+            .map(move |()| element )
     }
     pub fn remove(&mut self, element: ORElement<A>) -> Result<(), ORError<L, A>> {
         let op = Op::Remove(element);
@@ -567,20 +567,19 @@ impl<L, A> OR<L, A>
 #[cfg(test)]
 #[allow(dead_code)]
 mod test {
-    use {Log, UpdateError};
+    use {Log, UpdateError, NullError};
     use super::*;
     use test_helpers::*;
 
-    pub type UniqueSet = Unique<DumbLog<Op<u64>, UniqueState<u64>>, u64>;
-    pub type TestPN = super::PN<DumbLog<Op<u64>, PNState<u64>>, u64>;
-    pub type TestDumbLog = DumbLog<Op<u64>, UniqueState<u64>>;
-    pub type TestOR = super::OR<DumbLog<OROp<u64>, ORState<u64>>, u64>;
+    pub type UniqueSet = Unique<DumbLog<Op<u64>>, u64>;
+    pub type TestPN = super::PN<DumbLog<Op<u64>>, u64>;
+    pub type TestDumbLog = DumbLog<Op<u64>>;
+    pub type TestOR = super::OR<DumbLog<OROp<u64>>, u64>;
     impl_deliver! { UniqueState<u64>, UniqueSet => deliver_unique }
     impl_deliver! { PNState<u64>, TestPN => deliver_pn }
     impl_deliver! { ORState<u64>, OROp<u64>, TestOR => deliver_or }
-    impl_log_for_state! { UniqueState<u64> }
-    impl_log_for_state! { PNState<u64> }
-    impl_log_for_state! { ORState<u64>, OROp<u64> }
+    impl_log_for_state! { Op<u64> }
+    impl_log_for_state! { OROp<u64> }
 
     pub fn new_unique() -> UniqueSet {
         Unique::new_with_log(new_dumb_log!())
@@ -815,10 +814,8 @@ mod test {
         use super::super::*;
         use test_helpers::DumbLog;
 
-        type TestORError =
-            ORError<DumbLog<OROp<u64>, ORState<u64>>, u64>;
-        type TestORResult =
-            Result<(), TestORError>;
+        type TestORError = ORError<DumbLog<OROp<u64>>, u64>;
+        type TestORResult = Result<(), TestORError>;
 
         #[test]
         fn insert() {

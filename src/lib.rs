@@ -3,14 +3,16 @@
 //! This is a WIP, so expect that it might change in incompatible ways.
 
 #![allow(non_shorthand_field_patterns)]
-#![feature(box_syntax)]
-#![feature(core, hash, collections)]
+#![feature(box_syntax, box_patterns)]
+#![feature(core, collections)]
+#![feature(std_misc)]
 
 extern crate uuid;
 
 use std::default::Default;
 use std::error::{self};
-use std::fmt;
+use std::{cmp, fmt, ops};
+use std::marker::PhantomData;
 
 #[cfg(test)]
 #[macro_export]
@@ -19,7 +21,7 @@ macro_rules! impl_deliver {
         impl_deliver! { $state, Op<u64>, $set => $func_name }
     };
     ($state:ty, $op:ty, $set:ty => $func_name:ident) => {
-        pub fn $func_name(this: &DumbLog<$op, $state>,
+        pub fn $func_name(this: &DumbLog<$op>,
                           start: usize,
                           end: Option<usize>,
                           to: &mut $set) -> (usize,
@@ -36,18 +38,26 @@ macro_rules! impl_deliver {
 #[cfg(test)]
 #[macro_export]
 macro_rules! impl_log_for_state {
-    ($for_ty:ty) => {
-        impl_log_for_state! { $for_ty, Op<u64> }
-    };
-    ($for_type:ty, $op:ty) => {
-        impl Log<$op> for DumbLog<$op, $for_type> {
-            type Error = NullError;
-            fn apply_downstream(&mut self, op: $op) -> Result<(), NullError> {
+    ($op:ty) => {
+        impl ::Log<$op> for ::test_helpers::DumbLog<$op> {
+            type Error = ::NullError;
+
+            fn get_site_id(&self) -> ::SiteId {
+                use test_helpers::next_site_id;
+                if self.site_id.get().is_some() {
+                    return self.site_id.get().unwrap();
+                } else {
+                    self.site_id.set(Some(next_site_id()));
+                    return self.get_site_id();
+                }
+            }
+
+            fn apply_downstream(&mut self, op: $op) -> Result<(), ::NullError> {
                 // for tests we ignore the 'must be durable' stipulation.
                 self.downstreamed = self.downstreamed + 1;
                 self.add_to_log(op)
             }
-            fn add_to_log(&mut self, op: $op) -> Result<(), NullError> {
+            fn add_to_log(&mut self, op: $op) -> Result<(), ::NullError> {
                 self.log.push(op);
                 Ok(())
             }
@@ -59,6 +69,7 @@ macro_rules! impl_log_for_state {
 macro_rules! new_dumb_log(
     () => {
         DumbLog {
+            site_id: ::std::cell::Cell::new(None),
             log: Vec::new(),
             downstreamed: 0,
         }
@@ -68,8 +79,62 @@ macro_rules! new_dumb_log(
 pub mod set;
 pub mod treedoc;
 
+#[derive(Eq, PartialEq, Clone, Hash)]
+pub struct OrderedUuid(pub uuid::Uuid);
+
+impl PartialOrd for OrderedUuid {
+    fn partial_cmp(&self, rhs: &OrderedUuid) -> Option<cmp::Ordering> {
+        Some(self.cmp(rhs))
+    }
+}
+impl Ord for OrderedUuid {
+    fn cmp(&self, rhs: &OrderedUuid) -> cmp::Ordering {
+        fn get_uuid_u128(uuid: &uuid::Uuid) -> (u64, u64) {
+            let mut i = uuid.as_bytes().iter().map(|&v| v as u64 );
+            let s = &mut i;
+
+            fn n<I>(iter: &mut I) -> <I as Iterator>::Item
+                where I: Iterator,
+                      <I as Iterator>::Item: Clone,
+            {
+                iter.next().unwrap().clone()
+            }
+
+            (n(s) << 0  | n(s) << 8  | n(s) << 16 | n(s) << 24 |
+             n(s) << 32 | n(s) << 40 | n(s) << 48 | n(s) << 56,
+
+             n(s) << 0  | n(s) << 8  | n(s) << 16 | n(s) << 24 |
+             n(s) << 32 | n(s) << 40 | n(s) << 48 | n(s) << 56)
+        }
+
+        let &OrderedUuid(ref l) = self;
+        let &OrderedUuid(ref r) = rhs;
+        let lpair = get_uuid_u128(l);
+        let rpair = get_uuid_u128(r);
+
+        lpair.cmp(&rpair)
+    }
+}
+impl ops::Deref for OrderedUuid {
+    type Target = uuid::Uuid;
+    fn deref<'a>(&'a self) -> &'a uuid::Uuid {
+        let &OrderedUuid(ref inner) = self;
+        inner
+    }
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct SiteId(pub u64);
+
+pub trait SiteIdentifier {
+    fn site_id(&self) -> SiteId;
+}
+
 pub trait Log<Op> {
     type Error;
+
+    fn get_site_id(&self) -> SiteId;
+
     // Once this function returns, it is expected that all changes to
     // the log have been made durable. Additionally, this crate
     // assumes in order delivery, ie operations will be delivered in
@@ -116,12 +181,33 @@ impl<L, O> fmt::Display for UpdateError<L, O>
     }
 }
 
+// Our mock DumbLog can't fail:
+#[derive(Debug)]
+pub struct NullError;
+impl fmt::Display for NullError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "NullError")
+    }
+}
+impl error::Error for NullError {
+    fn description(&self) -> &str { panic!("this error should never happen"); }
+}
+
 #[derive(Debug, Clone)]
 pub struct StateBasedReplica<M, S>
-    where M: Fn(S, S) -> S;
+    where M: Fn(S, S) -> S
+{
+    _1: PhantomData<M>,
+    _2: PhantomData<S>,
+}
+
 #[derive(Debug, Clone)]
 pub struct OpBasedReplica<O, S>
-    where O: Operation<S>;
+    where O: Operation<S>
+{
+    _1: PhantomData<O>,
+    _2: PhantomData<S>,
+}
 
 pub trait ReplicationKind: Default {}
 impl<M, S> ReplicationKind for StateBasedReplica<M, S>
@@ -133,14 +219,21 @@ impl<M, S> Default for StateBasedReplica<M, S>
     where M: Fn(S, S) -> S,
 {
     fn default() -> StateBasedReplica<M, S> {
-        StateBasedReplica
+        StateBasedReplica {
+            _1: PhantomData,
+            _2: PhantomData,
+        }
     }
 }
 impl<O, S> Default for OpBasedReplica<O, S>
-    where O: Operation<S>, {
-        fn default() -> OpBasedReplica<O, S> {
-            OpBasedReplica
+    where O: Operation<S>,
+{
+    fn default() -> OpBasedReplica<O, S> {
+        OpBasedReplica {
+            _1: PhantomData,
+            _2: PhantomData,
         }
+    }
 }
 
 // A local replica of a state. Can be Op or State based.
@@ -197,29 +290,26 @@ impl<S: Default + Send, M: Fn(S, S) -> S> Replica<S, StateBasedReplica<M, S>> {
 }
 
 #[cfg(test)]
-mod test_helpers {
-    use {Operation};
-    use std::error::Error;
-    use std::fmt;
+pub mod test_helpers {
+    use {SiteId};
+    use std::cell::Cell;
 
-    // Our mock DumbLog can't fail:
-    #[derive(Show)]
-    pub struct NullError;
-    impl Error for NullError {
-        fn description(&self) -> &str { panic!("this error should never happen"); }
+    thread_local! { pub static SITE_COUNTER: Cell<u64> = Cell::new(0) }
+    pub fn next_site_id() -> SiteId {
+        SiteId(SITE_COUNTER.with(|v| {
+            v.set(v.get() + 1);
+            v.get()
+        }))
     }
-    impl fmt::Display for NullError {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str(self.description())
-        }
-    }
-    #[derive(Default, Clone, Show)]
-    pub struct DumbLog<O, S> where O: Operation<S> {
+
+    #[derive(Clone, Debug)]
+    pub struct DumbLog<O> {
+        pub site_id: Cell<Option<SiteId>>,
         pub log: Vec<O>,
 
         pub downstreamed: usize,
     }
-    impl<O, S> DumbLog<O, S> {
+    impl<O> DumbLog<O> {
         pub fn len(&self) -> usize { self.log.len() }
         pub fn downstreamed(&self) -> usize {
             self.downstreamed
