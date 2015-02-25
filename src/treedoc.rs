@@ -692,13 +692,7 @@ impl<L, A> Treedoc<L, A>
     }
 
     // TODO: return the value deleted.
-    pub fn delete(&mut self, at: Option<Path>) -> Result<(), TreedocError<L, A>> {
-        let at = at
-            .unwrap_or_else(|| {
-                let mut p = Path::new_empty();
-                p.set_last_disambiguator(self.next_disambiguator(), None);
-                p
-            });
+    pub fn remove(&mut self, at: Path) -> Result<(), TreedocError<L, A>> {
         let op = Op::Delete(at);
         self.update(op)
     }
@@ -870,7 +864,7 @@ mod test {
             let mut c = new_td();
             let p1 = c.insert_at(None, "test".to_string()).unwrap();
             let p2 = c.insert_left(p1.clone(), "test2".to_string()).unwrap();
-            c.delete(Some(p1)).unwrap();
+            c.remove(p1).unwrap();
             check_td(&c, "test2");
         }
         #[test]
@@ -955,8 +949,10 @@ mod test {
 
         #[test]
         fn delete_before_insert() {
+            use std::collections::BitVec;
             let mut c = new_td();
-            assert!(match c.delete(None) {
+            let p = Path::new_raw(BitVec::new(), None);
+            assert!(match c.remove(p) {
                 Err(UpdateError::Op(OpError::ValueNotPresent)) => true,
                 _ => false,
             });
@@ -969,7 +965,7 @@ mod test {
             let mut to_remove = c.insert_right(root.clone(), "tr1".to_string())
                 .unwrap();
             c.insert_right(to_remove.clone(), "tr2".to_string()).unwrap();
-            c.delete(Some(to_remove.clone())).unwrap();
+            c.remove(to_remove.clone()).unwrap();
             let mut empty = c.get_next_empty_path(Some(root), Side::Right);
             empty._test_take_last_disambiguator();
             to_remove._test_take_last_disambiguator();
