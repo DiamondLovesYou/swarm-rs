@@ -707,6 +707,10 @@ impl<L, A> Treedoc<L, A>
         }
     }
 
+    pub fn get(&self, p: &Path) -> Option<&A> {
+        self.state.query(move |s| s.get(p) )
+    }
+
     pub fn values(&self) -> ValuesIter<A> {
         self.state.query(move |state| state.values() )
     }
@@ -810,6 +814,7 @@ mod test {
         use {UpdateError, Log, NullError};
         use super::super::*;
         use test_helpers::*;
+        use std::default::Default;
         use std::slice::SliceConcatExt;
 
         type TestTD = Treedoc<DumbLog<Op<String>>, String>;
@@ -982,6 +987,20 @@ mod test {
             c.insert_at(Some(empty), "t2".to_string()).unwrap();
 
             check_td(&c, "t1 t2 t3 t4");
+        }
+
+        #[test]
+        fn get_a() {
+            let mut c = new_td();
+            let v = "t".to_string();
+            let p = c.insert_at(None, v.clone()).unwrap();
+            assert_eq!(c.get(&p), Some(&v));
+        }
+        #[test]
+        fn get_empty() {
+            let c = new_td();
+            let p = Path::new_raw(Default::default(), None);
+            assert_eq!(c.get(&p), None);
         }
     }
     mod path {
