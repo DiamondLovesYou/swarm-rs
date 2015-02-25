@@ -494,6 +494,15 @@ impl<L, A> Treedoc<L, A>
             Some(mut parent) => {
                 self.take_last_disambiguator_of_only_child(&mut parent);
                 let mut parent = self.prune_unambiguous(parent);
+                parent = parent.get_child(side);
+
+                if self.mini_siblings_of_inner(parent.clone()).next().is_none() {
+                    parent.set_last_disambiguator(self.next_disambiguator(),
+                                                  None);
+                    return parent;
+                }
+
+                let side = side.opposite_side();
                 loop {
                     parent = parent.get_child(side);
 
@@ -941,7 +950,7 @@ mod test {
         }
 
         #[test]
-        fn get_next_empty() {
+        fn get_next_empty_a() {
             let mut c = new_td();
             let root = c.insert_at(None, "t-root".to_string()).unwrap();
             let mut to_remove = c.insert_right(root.clone(), "tr1".to_string())
@@ -952,6 +961,18 @@ mod test {
             empty._test_take_last_disambiguator();
             to_remove._test_take_last_disambiguator();
             assert_eq!(empty, to_remove);
+        }
+
+        #[test]
+        fn get_next_empty_b() {
+            let mut c = new_td();
+            let root = c.insert_at(None, "t1".to_string()).unwrap();
+            let r1 = c.insert_right(root.clone(), "t4".to_string()).unwrap();
+            c.insert_left(r1.clone(), "t3".to_string()).unwrap();
+            let empty = c.get_next_empty_path(Some(root.clone()), Side::Right);
+            c.insert_at(Some(empty), "t2".to_string()).unwrap();
+
+            check_td(&c, "t1 t2 t3 t4");
         }
     }
     mod path {
