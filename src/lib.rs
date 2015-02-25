@@ -78,6 +78,7 @@ macro_rules! new_dumb_log(
 
 pub mod set;
 pub mod treedoc;
+pub mod graph;
 
 #[derive(Eq, PartialEq, Clone, Hash)]
 pub struct OrderedUuid(pub uuid::Uuid);
