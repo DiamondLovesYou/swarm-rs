@@ -5,6 +5,7 @@ use std::collections::btree_map::{self, Range};
 use std::collections::Bound::{Included, Excluded, Unbounded};
 use std::cmp::{Ordering};
 use std::default::Default;
+use std::fmt;
 
 pub use super::set::OpError;
 
@@ -436,8 +437,7 @@ pub type ValuesIter<'a, A> = btree_map::Values<'a, Path, A>;
 
 #[derive(Clone)]
 pub struct Treedoc<L, A>
-    where L: super::Log<Op<A>>,
-          A: Clone,
+    where A: Clone,
 {
     // a.k.a. the tree root
     state: Replica<A>,
@@ -743,6 +743,19 @@ impl<L, A> Treedoc<L, A>
             }
         }
         return (successful, Ok(()));
+    }
+}
+
+impl<L, A> fmt::Debug for Treedoc<L, A>
+    where A: fmt::Debug + Clone,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let s = self.state.query(move |s| s.iter() );
+        try!(write!(f, "Treedoc {{"));
+        for i in s {
+            try!(write!(f, " `{:?}`", i));
+        }
+        write!(f, "}}")
     }
 }
 
