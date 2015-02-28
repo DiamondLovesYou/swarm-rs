@@ -51,29 +51,38 @@ pub type VertId = Uuid;
 pub type Path = treedoc::Treedoc<NullLog, Uuid>;
 
 #[derive(Clone, Debug)]
-pub enum EditOp {
+pub enum EditOp<A> {
     Insert {
         pos: treedoc::Path,
         vert: VertId,
+
+        /// No duplicates allowed! The usize in the inner tuple specifies the
+        /// number of references this path will add to the vertice's reference
+        /// count.
+        verts: Vec<(VertId, (A, usize))>,
+
+        /// Doesn't have to be in order, but each path should be
+        /// unique. Duplicate vertex ids are allowed.
+        order: Vec<(treedoc::Path, VertId)>,
     },
     RemoveOne(treedoc::Path),
     RemoveMultiple(Vec<treedoc::Path>),
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Op<A> {
     Insert {
-        id: Uuid,
-        /// It's assumed no duplicate entries exist.
+        id: PathId,
+        /// It's assumed no duplicate entries exist in `verts`.
         verts: Vec<(Uuid, A)>,
+
         path: Path,
     },
     Edit {
-        path: Uuid,
-        /// Again, it's assumed no duplicate entries exist.
-        verts: Vec<(Uuid, A)>,
-        op: EditOp,
+        path_id: PathId,
+
+        op: EditOp<A>,
     },
-    Remove(Uuid),
+    Remove(PathId),
 }
 
 pub struct DAGraphIter<'a, 'b, L, A> where 'a: 'b, L: 'a, A: 'a {
@@ -148,6 +157,7 @@ pub enum Error<L, A>
 }
 pub type GraphResult<R, L, A> = Result<R, Error<L, A>>;
 
+#[derive(Clone)]
 pub struct DAGraph<L, A> {
     log: L,
     paths: HashMap<Uuid, Path>,
@@ -275,30 +285,58 @@ impl<L, A> DAGraph<L, A>
             },
         };
 
-        let mut verts: HashMap<Uuid, A> = HashMap::new();
+        let path_pos = p.get_next_empty_path(parent, side);
+
+        let mut verts: HashMap<Uuid, (A, usize)> = HashMap::new();
         verts.reserve(p.len());
-        for vid in p.values() {
+        let mut order = Vec::new();
+        let mut path_pos_insert = Some(path_pos.clone());
+        for (pos, vid) in p.iter() {
             let v = self.verts.get(vid);
             debug_assert!(v.is_some(), "invalid vert id present in path");
             let &(ref v, _) = v.unwrap();
-            verts.insert(vid.clone(), v.clone());
-        }
-        verts.insert(vert_id.clone(), vert_val.clone());
+            match verts.entry(vid.clone()) {
+                Entry::Vacant(ve) => {
+                    ve.insert((v.clone(), 1));
+                },
+                Entry::Occupied(oe) => {
+                    let &mut (_, ref mut rc) = oe.into_mut();
+                    *rc += 1;
+                },
+            }
 
-        let pos = p.get_next_empty_path(parent, side);
+            order.push((pos.clone(), vid.clone()));
+            if path_pos_insert.is_some() && pos > &path_pos {
+                order.push((path_pos_insert.take().unwrap(),
+                            vert_id.clone()));
+            }
+        }
+        match verts.entry(vert_id.clone()) {
+            Entry::Vacant(ve) => {
+                ve.insert((vert_val.clone(), 1));
+            },
+            Entry::Occupied(oe) => {
+                let &mut (_, ref mut rc) = oe.into_mut();
+                *rc += 1;
+            },
+        }
+
         let op = Op::Edit {
-            path: path,
-            verts: verts.into_iter().collect(),
+            path_id: path,
             op: EditOp::Insert {
                 vert: vert_id.clone(),
-                pos: pos.clone(),
+                pos: path_pos.clone(),
+
+
+                verts: verts.into_iter().collect(),
+                order: order,
             },
         };
 
         let logres = self.log.apply_downstream(op);
         if logres.is_err() { return Err(Error::Log(logres.err().unwrap())); }
 
-        p.insert_at(Some(pos.clone()), vert_id.clone())
+        p.insert_at(Some(path_pos.clone()), vert_id.clone())
             .unwrap();
 
         match self.verts.entry(vert_id.clone()) {
@@ -311,7 +349,7 @@ impl<L, A> DAGraph<L, A>
             }
         }
 
-        Ok((vert_id, pos))
+        Ok((vert_id, path_pos))
     }
 
     /// Empty positions in the path are ignored. Deplicate positions cause an error.
@@ -361,10 +399,8 @@ impl<L, A> DAGraph<L, A>
         }
 
         let op = Op::Edit {
-            path: pid.clone(),
-            verts: values.iter()
-                .map(move |(id, &(ref val, _))| (id.clone(), val.clone()) )
-                .collect(),
+            path_id: pid.clone(),
+
             op: if verts.len() == 1 {
                 EditOp::RemoveOne(verts[0].clone())
             } else {
@@ -484,6 +520,195 @@ impl<L, A> DAGraph<L, A>
             path_iter: None,
         }
     }
+
+    pub fn deliver(&mut self, op: Op<A>) {
+        match op {
+            Op::Insert { id, verts, path, } => {
+                assert!(!self.paths.contains_key(&id),
+                        "path already present; was this operation delivered \
+                         twice?");
+
+                let mut vert_map: Option<HashMap<VertId, A>> = None;
+                fn get_verts<'a, A>(verts: &Vec<(VertId, A)>,
+                                    vert_map: &'a mut Option<HashMap<VertId, A>>) ->
+                    &'a HashMap<VertId, A> where A: Clone
+                {
+                    // Lazy initialize the map:
+                    match vert_map {
+                        &mut Some(ref v) => v,
+                        &mut None => {
+                            let verts = verts.iter()
+                                .map(|&(ref id, ref v)| (id.clone(), v.clone()) )
+                                .collect();
+                            *vert_map = Some(verts);
+                            match vert_map {
+                                &mut Some(ref v) => v,
+                                _ => unreachable!(),
+                            }
+                        },
+                    }
+                };
+
+                self.paths.insert(id.clone(), path.clone());
+
+                for (_, vert) in path.iter() {
+                    match self.verts.entry(vert.clone()) {
+                        Entry::Vacant(ve) => {
+                            let val = get_verts(&verts, &mut vert_map)
+                                .get(vert)
+                                .expect("the operation is missing a vert!");
+                            ve.insert((val.clone(), 1));
+                        },
+                        Entry::Occupied(oe) => {
+                            let &mut (_, ref mut rc) = oe.into_mut();
+                            *rc += 1;
+                        },
+                    }
+                }
+            },
+            Op::Edit {
+                path_id,
+                op: EditOp::Insert {
+                    pos, vert: new_vert_id, verts, order,
+                },
+            } => {
+                match self.paths.entry(path_id) {
+                    Entry::Vacant(ve) => {
+                        // info!("path removed concurrently; re-inserting.");
+                        // In this case, we ignore `new_vert_id` && `pos`; they
+                        // both should already be in `verts` && `order`.
+
+                        // Insert any new vertices:
+                        for (vid, (val, count)) in verts.into_iter() {
+                            assert!(count > 0);
+                            match self.verts.entry(vid) {
+                                Entry::Vacant(ve) => {
+                                    ve.insert((val, count));
+                                },
+                                Entry::Occupied(oe) => {
+                                    // In this case, ignore the value in the op.
+                                    let &mut (_, ref mut rc) = oe.into_mut();
+                                    *rc += count;
+                                },
+                            }
+                        }
+
+
+                        let mut p = {
+                            let site_id = self.log.get_site_id();
+                            treedoc::Treedoc::new(NullLog(site_id))
+                        };
+
+                        for (position, vid) in order.into_iter() {
+                            debug_assert!(self.verts.contains_key(&vid));
+                            p.insert_at(Some(position), vid)
+                                .unwrap();
+                        }
+
+                        ve.insert(p);
+                    },
+                    Entry::Occupied(oe) => {
+                        // Ignore `order`.
+
+                        let mut val = None;
+                        for (id, (v, c)) in verts.into_iter() {
+                            if id == new_vert_id {
+                                assert!(c == 1);
+                                val = Some(v);
+                                break;
+                            }
+                        }
+
+                        assert!(val.is_some(), "operation error: operation is
+                                                missing requisite vertex!");
+
+                        match self.verts.entry(new_vert_id.clone()) {
+                            Entry::Vacant(ve) => {
+                                ve.insert((val.unwrap(), 1));
+                            }
+                            Entry::Occupied(oe) => {
+                                let &mut (_, ref mut rc) = oe.into_mut();
+                                *rc += 1;
+                            }
+                        }
+
+                        let p = oe.into_mut();
+                        p.insert_at(Some(pos), new_vert_id)
+                            .unwrap();
+                    },
+                }
+            },
+
+            Op::Edit {
+                path_id,
+                op: EditOp::RemoveOne(pos),
+            } => {
+                let p = self.paths.get_mut(&path_id);
+                if p.is_none() { return; }
+                let mut p = p.unwrap();
+
+                let vert_id = {
+                    let vert_id_opt = p.get(&pos);
+                    assert!(vert_id_opt.is_some());
+                    vert_id_opt
+                        .unwrap().clone()
+                };
+
+                match self.verts.entry(vert_id.clone()) {
+                    Entry::Vacant(_) => unreachable!(),
+                    Entry::Occupied(mut oe) => {
+                        let &(_, rc) = oe.get();
+                        if rc == 1 {
+                            oe.remove();
+                        } else {
+                            let &mut (_, ref mut rc) = oe.get_mut();
+                            *rc -= 1;
+                        }
+                    },
+                }
+
+                p.remove(pos).unwrap();
+            },
+
+            Op::Edit {
+                path_id,
+                op: EditOp::RemoveMultiple(poses),
+            } => {
+                let p = self.paths.get_mut(&path_id);
+                if p.is_none() { return; }
+                let p = p.unwrap();
+
+                for pos in poses.into_iter() {
+
+                    let vert_id = {
+                        let vert_id_opt = p.get(&pos);
+                        assert!(vert_id_opt.is_some());
+                        vert_id_opt
+                            .unwrap().clone()
+                    };
+
+                    match self.verts.entry(vert_id.clone()) {
+                        Entry::Vacant(_) => unreachable!(),
+                        Entry::Occupied(mut oe) => {
+                            let &(_, rc) = oe.get();
+                            if rc == 1 {
+                                oe.remove();
+                            } else {
+                                let &mut (_, ref mut rc) = oe.get_mut();
+                                *rc -= 1;
+                            }
+                        },
+                    }
+
+                    p.remove(pos).unwrap();
+                }
+            },
+
+            Op::Remove(path_id) => {
+                self.paths.remove(&path_id);
+            }
+        }
+    }
 }
 
 impl<L, A: fmt::Debug + Clone> fmt::Debug for DAGraph<L, A> {
@@ -498,11 +723,22 @@ mod test {
     impl_log_for_state! { super::Op<u64> }
     mod dag {
         use treedoc;
+        use uuid::Uuid;
         use test_helpers::*;
         use super::super::*;
-        fn new_dag() -> DAGraph<DumbLog<Op<u64>>, u64> {
+        type TestDag = DAGraph<DumbLog<Op<u64>>, u64>;
+        fn new_dag() -> TestDag {
             DAGraph::new_with_log(new_dumb_log!())
         }
+        fn new_path() -> Path {
+            use Log;
+
+            let l: DumbLog<Op<u64>> = new_dumb_log!();
+            let sid = l.get_site_id();
+
+            treedoc::Treedoc::new(NullLog(sid))
+        }
+
         #[test]
         fn inserts() {
             let mut l = new_dag();
@@ -668,6 +904,159 @@ mod test {
                 Err(Error::DuplicateEdge(ref edge)) if edge == val => true,
                 _ => false,
             });
+        }
+
+        #[test]
+        fn deliver_insert() {
+            let mut c = new_dag();
+            let id = Uuid::new_v4();
+            let vert_id = Uuid::new_v4();
+            let verts = vec![(vert_id.clone(), 5u64)];
+            let mut path = new_path();
+
+            path.insert_at(None, vert_id)
+                .unwrap();
+
+            let op = Op::Insert {
+                id: id,
+                verts: verts,
+                path: path,
+            };
+            c.deliver(op);
+        }
+        #[test] #[should_fail]
+        fn deliver_insert_fail_a() {
+            // ensure that invalid things are invalid.
+
+            let mut c = new_dag();
+            let id = Uuid::new_v4();
+            let vert_id = Uuid::new_v4();
+            let verts = vec![];
+            let mut path = new_path();
+
+            path.insert_at(None, vert_id)
+                .unwrap();
+
+            let op = Op::Insert {
+                id: id,
+                verts: verts,
+                path: path,
+            };
+            c.deliver(op);
+        }
+
+        fn check_values(v: TestDag, values: Vec<u64>) {
+            for ((_, _, _, &r), l) in v.iter().zip(values.into_iter()) {
+                assert_eq!(r, l);
+            }
+        }
+
+        #[test]
+        fn deliver_edit_a() {
+            let mut l = new_dag();
+            let (id, v) = l.insert_path(&[InsertionValue::New(5),
+                                          InsertionValue::New(6),
+                                          InsertionValue::New(8),])
+                .ok()
+                .unwrap();
+
+            let mut r = l.clone();
+
+            let &(_, ref p) = &v[1];
+            l.insert_vert_path(id, Some(p.clone()),
+                               InsertionValue::New(7),
+                               Side::Right)
+                .ok()
+                .unwrap();
+
+            r.deliver(l.log_imm().log[1].clone());
+            check_values(r, vec![5, 6, 7, 8]);
+        }
+        #[test]
+        fn deliver_edit_remove_single() {
+            let mut l = new_dag();
+            let (id, v) = l.insert_path(&[InsertionValue::New(5),
+                                          InsertionValue::New(6),
+                                          InsertionValue::New(7),
+                                          InsertionValue::New(8),])
+                .ok()
+                .unwrap();
+
+            let mut r = l.clone();
+
+            let &(_, ref p1) = &v[1];
+            let remove = vec![p1.clone()];
+            l.remove_path_verts(id, &remove[..])
+                .ok()
+                .unwrap();
+
+            r.deliver(l.log_imm().log[1].clone());
+            check_values(r, vec![5, 7, 8]);
+        }
+        #[test]
+        fn deliver_edit_remove_multiple() {
+            let mut l = new_dag();
+            let (id, v) = l.insert_path(&[InsertionValue::New(5),
+                                          InsertionValue::New(6),
+                                          InsertionValue::New(7),
+                                          InsertionValue::New(8),])
+                .ok()
+                .unwrap();
+
+            let mut r = l.clone();
+
+            let &(_, ref p1) = &v[1];
+            let &(_, ref p2) = &v[2];
+            let remove = vec![p1.clone(), p2.clone()];
+            l.remove_path_verts(id, &remove[..])
+                .ok()
+                .unwrap();
+
+            r.deliver(l.log_imm().log[1].clone());
+            check_values(r, vec![5, 8]);
+        }
+        #[test]
+        fn deliver_edit_insert_concurrent_remove() {
+            let mut l = new_dag();
+            let (id, v) = l.insert_path(&[InsertionValue::New(5),
+                                          InsertionValue::New(6),
+                                          InsertionValue::New(8),])
+                .ok()
+                .unwrap();
+
+            let mut r = l.clone();
+
+            let &(_, ref p) = &v[1];
+            l.insert_vert_path(id.clone(), Some(p.clone()),
+                               InsertionValue::New(7),
+                               Side::Right)
+                .ok()
+                .unwrap();
+
+            r.remove_path(&id)
+                .unwrap();
+
+            r.deliver(l.log_imm().log[1].clone());
+            check_values(r, vec![5, 6, 7, 8]);
+        }
+        #[test]
+        fn deliver_remove() {
+            let mut l = new_dag();
+            let (id, _) = l.insert_path(&[InsertionValue::New(5),
+                                          InsertionValue::New(6),
+                                          InsertionValue::New(8),])
+                .ok()
+                .unwrap();
+
+            l.deliver(Op::Remove(id));
+        }
+
+        #[test]
+        fn deliver_double_concurrent_remove() {
+            // double concurrent removes.
+            let mut l = new_dag();
+
+            l.deliver(Op::Remove(Uuid::new_v4()));
         }
     }
 }
