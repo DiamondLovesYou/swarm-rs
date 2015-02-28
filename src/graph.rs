@@ -1058,5 +1058,25 @@ mod test {
 
             l.deliver(Op::Remove(Uuid::new_v4()));
         }
+
+        #[test] #[should_fail]
+        fn deliver_insert_twice() {
+            let mut c = new_dag();
+            let id = Uuid::new_v4();
+            let vert_id = Uuid::new_v4();
+            let verts = vec![(vert_id.clone(), 5u64)];
+            let mut path = new_path();
+
+            path.insert_at(None, vert_id)
+                .unwrap();
+
+            let op = Op::Insert {
+                id: id,
+                verts: verts,
+                path: path,
+            };
+            c.deliver(op.clone());
+            c.deliver(op);
+        }
     }
 }
