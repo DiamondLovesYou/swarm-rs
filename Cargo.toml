@@ -3,6 +3,11 @@
 name = "swarm"
 version = "0.0.1"
 authors = ["Richard Diamond <wichard@vitalitystudios.com>"]
+build = "src/build.rs"
 
 [dependencies]
 uuid = "0.1"
+capnp = "0.1.24"
+
+[build-dependencies]
+capnpc = "0.1.24"

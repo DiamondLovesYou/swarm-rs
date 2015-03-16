@@ -8,6 +8,7 @@
 #![feature(std_misc)]
 
 extern crate uuid;
+extern crate capnp;
 
 use std::default::Default;
 use std::error::{self};
@@ -27,8 +28,7 @@ macro_rules! impl_deliver {
                           to: &mut $set) -> (usize,
                                              Result<(), UpdateError<NullError, OpError>>)
         {
-            let ops = this.log.as_slice()
-                .slice(start, end.unwrap_or(this.len()));
+            let ops = &this.log.as_slice()[start .. end.unwrap_or(this.len())];
             // You most likely didn't intend to deliver zero ops.
             assert!(ops.len() != 0);
             to.deliver(ops)
@@ -79,6 +79,20 @@ macro_rules! new_dumb_log(
 pub mod set;
 pub mod treedoc;
 pub mod graph;
+
+pub mod common_capnp {
+    include!(concat!(env!("OUT_DIR"), "/common_capnp.rs"));
+}
+
+#[doc(hidden)]
+pub mod dagraph_capnp {
+    pub use graph::dagraph_capnp::*;
+}
+
+#[doc(hidden)]
+pub mod treedoc_capnp {
+    pub use treedoc::treedoc_capnp::*;
+}
 
 #[derive(Eq, PartialEq, Clone, Hash)]
 pub struct OrderedUuid(pub uuid::Uuid);

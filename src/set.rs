@@ -103,7 +103,7 @@ impl<LHSL, RHSL, A> PartialEq<Unique<RHSL, A>> for Unique<LHSL, A>
           A: PartialEq + Ord + Clone,
 {
     fn eq(&self, rhs: &Unique<RHSL, A>) -> bool {
-        self.state.query(move |&: lhs| {
+        self.state.query(move |lhs| {
             lhs.eq(rhs.state.query(move |state| state ))
         })
     }
@@ -124,7 +124,7 @@ impl<Log, Atom> Unique<Log, Atom>
 
     pub fn lookup(&self, v: &Atom) -> bool {
         self.state
-            .query(move |&: state: &UniqueState<Atom>| {
+            .query(move |state: &UniqueState<Atom>| {
                 match state.get(v) {
                     Some(tomb) => !(*tomb),
                     None => false,
@@ -250,7 +250,7 @@ impl<LHSL, RHSL, A> PartialEq<PN<RHSL, A>> for PN<LHSL, A>
           A: PartialEq + Ord + Clone,
 {
     fn eq(&self, rhs: &PN<RHSL, A>) -> bool {
-        self.state.query(move |&: lhs| {
+        self.state.query(move |lhs| {
             lhs.eq(rhs.state.query(move |state| state ))
         })
     }
@@ -278,7 +278,7 @@ impl<L, A> PN<L, A>
     }
     pub fn count(&self, k: &A) -> i64 {
         self.state
-            .query(move |&: state| {
+            .query(move |state| {
                 match state.get(k) {
                     None => 0,
                     Some(&(ref added, ref removed)) => *added as i64 - *removed as i64,
@@ -382,7 +382,7 @@ impl<Atom> GrowOnlySetState<Atom> where Atom: Ord + Send {
 
     pub fn lookup<T: ?Sized>(&self, v: &T) -> bool where Atom: Borrow<T>, T: Ord {
         self.inner_imm()
-            .query(move |&: state: &BTreeSet<Atom>| {
+            .query(move |state: &BTreeSet<Atom>| {
                 state.contains(v)
             })
     }
@@ -516,7 +516,7 @@ impl<L, A> OR<L, A>
 
     pub fn lookup(&self, element: &ORElement<A>) -> bool {
         self.state
-            .query(move |&: s| s.contains(element) )
+            .query(move |s| s.contains(element) )
     }
 
     fn update(&mut self, op: OROp<A>) -> Result<(), ORError<L, A>> {

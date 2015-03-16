@@ -12,6 +12,10 @@ use super::treedoc;
 pub use super::treedoc::Side;
 use super::{NullError, SiteId};
 
+pub mod dagraph_capnp {
+    include!(concat!(env!("OUT_DIR"), "/graph/dagraph_capnp.rs"));
+}
+
 // First up, a DAG type. Because a DAG is acyclic, we store the
 // graph as a set of treedocs, one for each path through the graph. Every vertex
 // gets its own Uuid, assigned by node which initially created it. To insert a
@@ -924,7 +928,7 @@ mod test {
             };
             c.deliver(op);
         }
-        #[test] #[should_fail]
+        #[test] #[should_panic]
         fn deliver_insert_fail_a() {
             // ensure that invalid things are invalid.
 
@@ -1059,7 +1063,7 @@ mod test {
             l.deliver(Op::Remove(Uuid::new_v4()));
         }
 
-        #[test] #[should_fail]
+        #[test] #[should_panic]
         fn deliver_insert_twice() {
             let mut c = new_dag();
             let id = Uuid::new_v4();

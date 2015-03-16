@@ -7,6 +7,10 @@ use std::cmp::{Ordering};
 use std::default::Default;
 use std::fmt;
 
+pub mod treedoc_capnp {
+    include!(concat!(env!("OUT_DIR"), "/treedoc/treedoc_capnp.rs"));
+}
+
 pub use super::set::OpError;
 
 pub use super::SiteId;
@@ -228,6 +232,7 @@ impl Path {
             })
     }
 
+    #[allow(dead_code)]
     fn last_path_mut(&mut self) -> &mut Path {
         match self.next {
             None | Some((_, None)) => {},
@@ -1131,7 +1136,7 @@ mod test {
             assert!(l < r);
         }
         #[test]
-        #[should_fail]
+        #[should_panic]
         pub fn disambiguator_with_suffix() {
             // it's impossible to insert a child node before the parent mininode.
             let l = {
